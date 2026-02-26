@@ -462,6 +462,75 @@ Returns the result or signals an error."
             (should (not result)))))
     (tramp-rpc-mock-test--stop-server)))
 
+(ert-deftest tramp-rpc-mock-test-server-highlevel-locate-dominating-file ()
+  "Test high-level locate-dominating-file RPC helper."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let* ((root (expand-file-name "highlevel-root" tramp-rpc-mock-test-temp-dir))
+               (deep (expand-file-name "a/b/c/d" root))
+               (file (expand-file-name "file.txt" deep)))
+          (make-directory deep t)
+          (make-directory (expand-file-name ".git" root) t)
+          (with-temp-file file (insert "x"))
+          (let* ((result (tramp-rpc-mock-test--rpc-call
+                          "highlevel.locate_dominating_file_multi"
+                          `((file . ,(encode-coding-string file 'utf-8))
+                            (names . [".git" ".dir-locals.el"]))))
+                 (first (car result)))
+            (should (stringp first))
+            (should (string-match-p "/highlevel-root/\\.git\\'" first)))))
+    (tramp-rpc-mock-test--stop-server)))
+
+(ert-deftest tramp-rpc-mock-test-server-highlevel-test-files-in-dir ()
+  "Test high-level dir-locals file listing RPC helper."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let ((dir (expand-file-name "highlevel-locals" tramp-rpc-mock-test-temp-dir)))
+          (make-directory dir t)
+          (with-temp-file (expand-file-name ".dir-locals.el" dir) (insert "x"))
+          (with-temp-file (expand-file-name ".dir-locals-2.el" dir) (insert "y"))
+          (let ((result (tramp-rpc-mock-test--rpc-call
+                         "highlevel.test_files_in_dir"
+                         `((directory . ,(encode-coding-string dir 'utf-8))
+                           (names . [".dir-locals.el" ".dir-locals-2.el" "missing.el"])))))
+            (should (= 2 (length result)))
+            (should (seq-some (lambda (p) (string-match-p "\\.dir-locals\\.el\\'" p)) result))
+            (should (seq-some (lambda (p) (string-match-p "\\.dir-locals-2\\.el\\'" p)) result)))))
+    (tramp-rpc-mock-test--stop-server)))
+
+(ert-deftest tramp-rpc-mock-test-server-highlevel-dir-locals-cache-update ()
+  "Test high-level dir-locals cache update RPC helper."
+  :tags '(:server)
+  (skip-unless tramp-rpc-mock-test--msgpack-available)
+  (skip-unless (tramp-rpc-mock-test--find-server))
+  (unwind-protect
+      (progn
+        (tramp-rpc-mock-test--start-server)
+        (let* ((root (expand-file-name "highlevel-cache" tramp-rpc-mock-test-temp-dir))
+               (deep (expand-file-name "x/y/z" root))
+               (file (expand-file-name "new-file.txt" deep)))
+          (make-directory deep t)
+          (with-temp-file (expand-file-name ".dir-locals.el" root) (insert "((nil . nil))"))
+          (let* ((result (tramp-rpc-mock-test--rpc-call
+                          "highlevel.dir_locals_find_file_cache_update"
+                          `((file . ,(encode-coding-string file 'utf-8))
+                            (names . [".dir-locals.el" ".dir-locals-2.el"])
+                            (cache_dirs . [,(encode-coding-string root 'utf-8)]))))
+                 (locals (alist-get 'locals result)))
+            (should (alist-get 'file result))
+            (should locals)
+            (should (string-match-p "/highlevel-cache\\'" (alist-get 'dir locals)))
+            (should (alist-get 'files locals)))))
+    (tramp-rpc-mock-test--stop-server)))
+
 (ert-deftest tramp-rpc-mock-test-server-process-run ()
   "Test process.run RPC call."
   :tags '(:server :process)
