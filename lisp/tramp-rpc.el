@@ -2296,9 +2296,9 @@ process-file calls from VC backends are routed through our tramp handler."
 
 (defun tramp-rpc-handle-exec-path ()
   "Return remote exec-path using RPC.
-Appends the remote working directory as the last element (the equivalent
-of `exec-directory'), matching `tramp-sh-handle-exec-path' behavior.
-Caches the PATH portion per connection."
+Returns the resolved remote PATH honoring `tramp-remote-path'
+(`tramp-own-remote-path' and `tramp-default-remote-path' included),
+cached per connection."
   (with-parsed-tramp-file-name default-directory nil
     (let* ((key (tramp-rpc--connection-key v))
            (cached (gethash key tramp-rpc--exec-path-cache))
@@ -2315,21 +2315,66 @@ Caches the PATH portion per connection."
 (defun tramp-rpc--fetch-remote-exec-path (vec)
   "Fetch the remote PATH from VEC and split into directories."
   (condition-case nil
+      (tramp-rpc--resolve-remote-path vec)
+    (error
+     ;; On error, return default paths
+     '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
+
+(defun tramp-rpc--fetch-remote-own-path (vec)
+  "Fetch remote PATH from login shell for VEC."
+  (let* ((result (tramp-rpc--call vec "process.run"
+                                  `((cmd . "/bin/sh")
+                                    (args . ["-l" "-c" "echo $PATH"])
+                                    (cwd . "/"))))
+         (exit-code (alist-get 'exit_code result))
+         (stdout (tramp-rpc--decode-output
+                  (alist-get 'stdout result)
+                  (alist-get 'stdout_encoding result))))
+    (if (and (eq exit-code 0) (> (length stdout) 0))
+        (split-string (string-trim stdout) ":" t)
+      '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
+
+(defun tramp-rpc--fetch-default-remote-path (vec)
+  "Fetch default PATH (getconf PATH) for VEC."
+  (condition-case nil
       (let* ((result (tramp-rpc--call vec "process.run"
-                                       `((cmd . "/bin/sh")
-                                         (args . ["-l" "-c" "echo $PATH"])
-                                         (cwd . "/"))))
+                                      `((cmd . "getconf")
+                                        (args . ["PATH"])
+                                        (cwd . "/"))))
              (exit-code (alist-get 'exit_code result))
              (stdout (tramp-rpc--decode-output
                       (alist-get 'stdout result)
                       (alist-get 'stdout_encoding result))))
         (if (and (eq exit-code 0) (> (length stdout) 0))
             (split-string (string-trim stdout) ":" t)
-          ;; Fallback to default paths
-          '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin")))
+          '("/bin" "/usr/bin")))
     (error
-     ;; On error, return default paths
-     '("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/sbin" "/usr/sbin" "/sbin"))))
+     '("/bin" "/usr/bin"))))
+
+(defun tramp-rpc--resolve-remote-path (vec)
+  "Resolve `tramp-remote-path' for VEC.
+This honors string entries in `tramp-remote-path' (including `~') and
+placeholder symbols `tramp-own-remote-path' and `tramp-default-remote-path'."
+  (with-current-buffer (tramp-get-connection-buffer vec)
+    (tramp-set-connection-local-variables vec)
+    (let* ((remote-path (copy-tree tramp-remote-path))
+           (resolved
+            (cl-loop
+             for entry in remote-path
+             append
+             (cond
+              ((eq entry 'tramp-own-remote-path)
+               (tramp-rpc--fetch-remote-own-path vec))
+              ((eq entry 'tramp-default-remote-path)
+               (tramp-rpc--fetch-default-remote-path vec))
+              ((stringp entry)
+               (list (if (string-prefix-p "~" entry)
+                         (tramp-rpc--expand-tilde vec entry)
+                       entry)))
+              (t nil)))))
+      (cl-remove-duplicates
+       (cl-remove-if #'string-empty-p resolved)
+       :test #'string-equal :from-end t))))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
