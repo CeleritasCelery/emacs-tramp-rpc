@@ -413,51 +413,49 @@ Otherwise clear all entries."
           (remhash key tramp-rpc--executable-cache)))
     (clrhash tramp-rpc--executable-cache)))
 
-(defun tramp-rpc--resolve-executable (vec program)
-  "Resolve PROGRAM to its full path on VEC.
-Returns the full path if found, otherwise the original PROGRAM.
-Results are cached per connection."
-  (if (file-name-absolute-p program)
-      program
-    (let* ((cache-key (cons (tramp-rpc--connection-key vec) program))
-           (cached (gethash cache-key tramp-rpc--executable-cache)))
-      (cond
-       ((stringp cached) cached)  ; Cached full path
-       ((eq cached :not-found) program)  ; Known not found, use original
-       (t  ; Not cached, look it up
-        (let ((found (tramp-rpc--find-executable vec program)))
-          (puthash cache-key (or found :not-found) tramp-rpc--executable-cache)
-           (or found program)))))))
-
 (defun tramp-rpc--find-executable (vec program)
   "Find PROGRAM in the remote PATH on VEC.
 Returns the absolute path or nil.
-Uses `command -v` for efficient lookup via login shell.
-Uses a unique marker to separate MOTD/banner text from actual output,
-following the pattern used by standard TRAMP."
-  (condition-case err
-      (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
-             ;; This is the same approach used by tramp-sh.el
-             (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
-             (result (tramp-rpc--call vec "process.run"
-                                       `((cmd . "/bin/sh")
-                                         (args . ["-l" "-c"
-                                                  ,(format "echo %s; command -v %s"
-                                                           marker (shell-quote-argument program))])
-                                         (cwd . "/"))))
-             (exit-code (alist-get 'exit_code result))
-             (stdout (tramp-rpc--decode-output
-                      (alist-get 'stdout result)
-                      (alist-get 'stdout_encoding result))))
-        (when (and (eq exit-code 0) (> (length stdout) 0))
-          ;; Find the marker and extract the path after it
-          (when (string-match (concat (regexp-quote marker) "\n\\([^\n]+\\)") stdout)
-            (let ((path (string-trim (match-string 1 stdout))))
-              (when (string-prefix-p "/" path)
-                path)))))
-    (error
-     (tramp-rpc--debug "find-executable failed for %s: %S" program err)
-     nil)))
+Prefers resolved remote `exec-path' (honoring `tramp-remote-path').
+Falls back to `command -v` via login shell when needed."
+  (or
+   ;; Prefer resolved exec-path first, so `tramp-remote-path' precedence
+   ;; matches what callers observe via `exec-path' and `executable-find'.
+   (tramp-rpc--find-executable-in-remote-path vec program)
+   (condition-case nil
+       (let* (;; Use a unique marker (MD5 hash) to delimit output from MOTD text
+              ;; This is the same approach used by tramp-sh.el
+              (marker (md5 (format "tramp-rpc-%s-%s" program (float-time))))
+              (result (tramp-rpc--call vec "process.run"
+                                        `((cmd . "/bin/sh")
+                                          (args . ["-l" "-c"
+                                                   ,(format "echo %s; command -v %s"
+                                                            marker (shell-quote-argument program))])
+                                          (cwd . "/"))))
+              (exit-code (alist-get 'exit_code result))
+              (stdout (tramp-rpc--decode-output
+                       (alist-get 'stdout result)
+                       (alist-get 'stdout_encoding result))))
+         (when (and (eq exit-code 0) (> (length stdout) 0))
+           ;; Find the marker and extract the path after it
+           (when (string-match (concat (regexp-quote marker) "\n\\([^\n]+\\)") stdout)
+             (let ((path (string-trim (match-string 1 stdout))))
+               (when (string-prefix-p "/" path)
+                 path)))))
+     (error nil))))
+
+(defun tramp-rpc--find-executable-in-remote-path (vec program)
+  "Search PROGRAM in resolved remote exec-path on VEC.
+Returns absolute path or nil."
+  (catch 'found
+    (dolist (dir (tramp-rpc--get-remote-exec-path vec))
+      (let ((candidate (expand-file-name program dir)))
+        (when (condition-case nil
+                  (tramp-rpc--call vec "file.executable"
+                                   (tramp-rpc--encode-path candidate))
+                (error nil))
+          (throw 'found candidate))))
+    nil))
 
 (defun tramp-rpc--connection-key (vec)
   "Generate a connection key for VEC.
@@ -2104,12 +2102,14 @@ This is much faster than running each command sequentially over TRAMP
 because all commands are sent in a single network round-trip."
   (with-parsed-tramp-file-name directory nil
     (setq localname (file-name-unquote localname))
-    (let* ((requests
+    (let* ((process-env (tramp-rpc--build-process-env v localname))
+           (requests
             (mapcar (lambda (args)
                       (cons "process.run"
                             `((cmd . "git")
                               (args . ,(vconcat args))
-                              (cwd . ,localname))))
+                              (cwd . ,localname)
+                              (env . ,process-env))))
                     commands))
            (results (tramp-rpc--call-pipelined v requests)))
       ;; Convert results to a more convenient format
@@ -2205,7 +2205,7 @@ signal numbers to human-readable strings like \"Interrupt\" or
 (defun tramp-rpc-handle-process-file
     (program &optional infile destination _display &rest args)
   "Like `process-file' for TRAMP-RPC files.
-Resolves PROGRAM path and loads direnv environment from working directory.
+Runs PROGRAM using a PATH derived from `tramp-remote-path' and direnv.
 When `tramp-rpc-magit--process-caches' is populated (during magit
 refresh), git commands are served from the prefetch cache when possible."
   (with-parsed-tramp-file-name default-directory nil
@@ -2221,34 +2221,26 @@ refresh), git commands are served from the prefetch cache when possible."
             (tramp-rpc--route-process-file-output destination stdout)
             exit-code)
         ;; Cache miss - make actual RPC call
-        (let* ((resolved-program (tramp-rpc--resolve-executable v program))
-               (direnv-env (tramp-rpc--get-direnv-environment v localname))
+        (let* ((process-env (tramp-rpc--build-process-env v localname))
                (stdin-content (when (and infile (not (eq infile t)))
                                 (with-temp-buffer
                                   (set-buffer-multibyte nil)
                                   (insert-file-contents-literally infile)
                                   (buffer-string))))
-               (result (condition-case _err
-                           (tramp-rpc--call v "process.run"
-                                            `((cmd . ,resolved-program)
-                                              (args . ,(vconcat args))
-                                              (cwd . ,localname)
-                                              ,@(when direnv-env
-                                                  `((env . ,direnv-env)))
-                                              ,@(when stdin-content
-                                                  `((stdin . ,stdin-content)))))
-                         ;; When the binary doesn't exist or can't be
-                         ;; spawned, return exit code 127 (command not
-                         ;; found) instead of signaling an error.
-                         (remote-file-error nil))))
-          (if result
-              (let ((exit-code (alist-get 'exit_code result))
-                    (stdout (tramp-rpc--decode-output
-                             (alist-get 'stdout result)
-                             (alist-get 'stdout_encoding result)))
-                    (stderr (tramp-rpc--decode-output
-                             (alist-get 'stderr result)
-                             (alist-get 'stderr_encoding result))))
+               (result (tramp-rpc--call v "process.run"
+                                        `((cmd . ,program)
+                                          (args . ,(vconcat args))
+                                          (cwd . ,localname)
+                                          (env . ,process-env)
+                                          ,@(when stdin-content
+                                              `((stdin . ,stdin-content))))))
+               (exit-code (alist-get 'exit_code result))
+               (stdout (tramp-rpc--decode-output
+                        (alist-get 'stdout result)
+                        (alist-get 'stdout_encoding result)))
+               (stderr (tramp-rpc--decode-output
+                        (alist-get 'stderr result)
+                        (alist-get 'stderr_encoding result))))
 
                 ;; Handle destination
                 (tramp-rpc--route-process-file-output destination stdout stderr)
@@ -2268,9 +2260,7 @@ refresh), git commands are served from the prefetch cache when possible."
                          (natnump exit-code) (>= exit-code 128))
                     (let ((strings (tramp-rpc--get-signal-strings v)))
                       (aref strings (- exit-code 128)))
-                  exit-code))
-            ;; Process spawn failed - return 127 (command not found)
-            127))))))
+                  exit-code))))))
 
 (defun tramp-rpc-handle-vc-registered (file)
   "Like `vc-registered' for TRAMP-RPC files.
@@ -2294,23 +2284,22 @@ process-file calls from VC backends are routed through our tramp handler."
 (defvar tramp-rpc--exec-path-cache (make-hash-table :test 'equal)
   "Cache of remote exec-path keyed by connection-key.")
 
+(defun tramp-rpc--get-remote-exec-path (vec)
+  "Return cached remote exec-path for VEC, fetching once when needed."
+  (let* ((key (tramp-rpc--connection-key vec))
+         (cached (gethash key tramp-rpc--exec-path-cache)))
+    (or cached
+        (let ((path (tramp-rpc--fetch-remote-exec-path vec)))
+          (puthash key path tramp-rpc--exec-path-cache)
+          path))))
+
 (defun tramp-rpc-handle-exec-path ()
   "Return remote exec-path using RPC.
 Returns the resolved remote PATH honoring `tramp-remote-path'
 (`tramp-own-remote-path' and `tramp-default-remote-path' included),
 cached per connection."
   (with-parsed-tramp-file-name default-directory nil
-    (let* ((key (tramp-rpc--connection-key v))
-           (cached (gethash key tramp-rpc--exec-path-cache))
-           (remote-path (or cached
-                            (let ((path (tramp-rpc--fetch-remote-exec-path v)))
-                              (puthash key path tramp-rpc--exec-path-cache)
-                              path))))
-      ;; Append localname of default-directory as last element,
-      ;; the equivalent to `exec-directory'.
-      (append remote-path
-              (list (tramp-file-local-name
-                     (expand-file-name default-directory)))))))
+    (tramp-rpc--get-remote-exec-path v)))
 
 (defun tramp-rpc--fetch-remote-exec-path (vec)
   "Fetch the remote PATH from VEC and split into directories."
@@ -2375,6 +2364,22 @@ placeholder symbols `tramp-own-remote-path' and `tramp-default-remote-path'."
       (cl-remove-duplicates
        (cl-remove-if #'string-empty-p resolved)
        :test #'string-equal :from-end t))))
+
+(defun tramp-rpc--build-process-env (vec directory &optional extra-env)
+  "Build environment alist for remote process execution.
+Ensures PATH reflects resolved remote exec-path for VEC and DIRECTORY,
+including `tramp-remote-path' customizations.  Merges in direnv values
+and EXTRA-ENV, with PATH forced to the resolved value."
+  (let* ((resolved-path (string-join (tramp-rpc--get-remote-exec-path vec) ":"))
+         (direnv-env (tramp-rpc--get-direnv-environment vec directory))
+         ;; Keep non-PATH direnv values; PATH is controlled centrally here.
+         (direnv-no-path
+          (cl-remove-if (lambda (entry) (equal (car entry) "PATH")) direnv-env))
+         (extra-no-path
+          (cl-remove-if (lambda (entry) (equal (car entry) "PATH")) extra-env)))
+    (append direnv-no-path
+            extra-no-path
+            (list (cons "PATH" resolved-path)))))
 
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."

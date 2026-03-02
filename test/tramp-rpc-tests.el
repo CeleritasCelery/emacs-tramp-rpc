@@ -1129,6 +1129,97 @@ and returns a valid path."
           (should (string-match-p "async-test" output)))
       (ignore-errors (delete-process proc)))))
 
+(ert-deftest tramp-rpc-test14b-start-file-process-respects-tramp-remote-path ()
+  "Ensure `start-file-process' resolves executables from `tramp-remote-path'."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-dir dir
+    (let* ((default-directory dir)
+           (bin-dir (concat dir "/custom-bin"))
+           (tool-name "tramp-rpc-custom-tool")
+           (tool-path (concat bin-dir "/" tool-name))
+           (output "")
+           (orig-remote-path tramp-remote-path)
+           proc)
+      (unwind-protect
+          (progn
+            (make-directory bin-dir t)
+            (write-region "#!/bin/sh\necho custom-tool-ok\n" nil tool-path)
+            (set-file-modes tool-path #o755)
+            (add-to-list 'tramp-remote-path (file-local-name bin-dir))
+            ;; Ensure path/executable resolution is recomputed.
+            (clrhash tramp-rpc--exec-path-cache)
+            (tramp-rpc--clear-executable-cache)
+            (setq proc (start-file-process "test-proc-path" nil tool-name))
+            (set-process-filter
+             proc (lambda (_proc str) (setq output (concat output str))))
+            (with-timeout (10 (error "Process timeout"))
+              (while (process-live-p proc)
+                (accept-process-output proc 0.1)))
+            (should (string-match-p "custom-tool-ok" output)))
+        (setq tramp-remote-path orig-remote-path)
+        (ignore-errors (delete-process proc))))))
+
+(ert-deftest tramp-rpc-test14c-start-file-process-prefers-tramp-remote-path-precedence ()
+  "Ensure executable resolution prefers `tramp-remote-path' order over shell default PATH."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-dir dir
+    (let* ((default-directory dir)
+           (bin-dir (concat dir "/custom-bin"))
+           ;; "ls" should already exist in remote shell PATH, so this test
+           ;; verifies that our custom directory still takes precedence.
+           (tool-name "ls")
+           (tool-path (concat bin-dir "/" tool-name))
+           (output "")
+           (orig-remote-path tramp-remote-path)
+           proc)
+      (unwind-protect
+          (progn
+            (make-directory bin-dir t)
+            (write-region "#!/bin/sh\necho custom-ls-ok\n" nil tool-path)
+            (set-file-modes tool-path #o755)
+            (add-to-list 'tramp-remote-path (file-local-name bin-dir))
+            (clrhash tramp-rpc--exec-path-cache)
+            (tramp-rpc--clear-executable-cache)
+            (setq proc (start-file-process "test-proc-path-precedence" nil tool-name))
+            (set-process-filter
+             proc (lambda (_proc str) (setq output (concat output str))))
+            (with-timeout (10 (error "Process timeout"))
+              (while (process-live-p proc)
+                (accept-process-output proc 0.1)))
+            (should (string-match-p "custom-ls-ok" output)))
+        (setq tramp-remote-path orig-remote-path)
+        (ignore-errors (delete-process proc))))))
+
+(ert-deftest tramp-rpc-test14d-process-file-prefers-tramp-remote-path-precedence ()
+  "Ensure `process-file' (process.run RPC) prefers `tramp-remote-path' order."
+  :tags '(:process :expensive-test)
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-dir dir
+    (let* ((default-directory dir)
+           (bin-dir (concat dir "/custom-bin"))
+           (tool-name "ls")
+           (tool-path (concat bin-dir "/" tool-name))
+           (orig-remote-path tramp-remote-path)
+           output)
+      (unwind-protect
+          (progn
+            (make-directory bin-dir t)
+            (write-region "#!/bin/sh\necho custom-process-file-ok\n" nil tool-path)
+            (set-file-modes tool-path #o755)
+            (add-to-list 'tramp-remote-path (file-local-name bin-dir))
+            (clrhash tramp-rpc--exec-path-cache)
+            (tramp-rpc--clear-executable-cache)
+            (with-temp-buffer
+              (process-file tool-name nil t nil)
+              (setq output (buffer-string)))
+            (should (string-match-p "custom-process-file-ok" output)))
+        (setq tramp-remote-path orig-remote-path)))))
+
 (ert-deftest tramp-rpc-test14-make-process ()
   "Test `make-process' for TRAMP RPC files."
   :tags '(:process :expensive-test)

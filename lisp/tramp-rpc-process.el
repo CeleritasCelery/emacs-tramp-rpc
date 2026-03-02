@@ -41,7 +41,7 @@
 (declare-function tramp-rpc--call "tramp-rpc")
 (declare-function tramp-rpc--call-fast "tramp-rpc")
 (declare-function tramp-rpc--call-async "tramp-rpc")
-(declare-function tramp-rpc--resolve-executable "tramp-rpc")
+(declare-function tramp-rpc--build-process-env "tramp-rpc")
 (declare-function tramp-rpc--get-direnv-environment "tramp-rpc")
 (declare-function tramp-rpc--decode-output "tramp-rpc")
 (declare-function tramp-rpc--controlmaster-socket-path "tramp-rpc")
@@ -361,7 +361,8 @@ ARGS are keyword arguments as per `make-process'.
 Supports PTY allocation when :connection-type is \\='pty or t,
 or when `process-connection-type' is t.
 For pipe mode, uses async polling for long-running processes.
-Resolves program path and loads direnv environment from working directory."
+Loads direnv environment and a resolved PATH from `tramp-remote-path'
+for remote command execution."
   (let* ((name (plist-get args :name))
          (buffer-arg (plist-get args :buffer))
          ;; tramp-handle-shell-command passes (output-buffer error-file)
@@ -403,9 +404,9 @@ Resolves program path and loads direnv environment from working directory."
           ;; Pipe mode - use a local cat process as relay for proper I/O events
           ;; This is needed because accept-process-output waits for actual I/O,
           ;; not just filter calls
-          (let* ((remote-program (tramp-rpc--resolve-executable v program))
+          (let* ((process-env (tramp-rpc--build-process-env v localname direnv-env))
                  (remote-pid (tramp-rpc--start-remote-process
-                              v remote-program program-args localname direnv-env))
+                              v program program-args localname process-env))
                  ;; Use a local cat process as relay - we write output to its stdin
                  ;; and it echoes to stdout, triggering proper I/O events
                  (local-process (let ((process-connection-type nil)) ; Use pipes, not PTY
@@ -442,7 +443,7 @@ Resolves program path and loads direnv environment from working directory."
                    tramp-rpc--async-processes)
 
           (tramp-rpc--debug "MAKE-PROCESS created local=%s remote-pid=%s program=%s"
-                           local-process remote-pid remote-program)
+                           local-process remote-pid program)
 
           ;; Start async read loop
           (tramp-rpc--start-async-read local-process)
@@ -512,13 +513,14 @@ DIRENV-ENV is an optional alist of environment variables from direnv."
          (port (tramp-file-name-port vec))
          (program (car command))
          (program-args (cdr command))
+         (process-env (tramp-rpc--build-process-env vec localname direnv-env))
          ;; Build environment exports for the remote command
          (env-exports (mapconcat
                        (lambda (pair)
                          (format "export %s=%s;"
                                  (car pair)
                                  (shell-quote-argument (cdr pair))))
-                       (append direnv-env
+                       (append process-env
                                `(("TERM" . ,(or (getenv "TERM") "xterm-256color"))))
                        " "))
          ;; Build the remote command - cd to dir, export env, exec program
@@ -610,17 +612,17 @@ LOCALNAME is the remote working directory.
 DIRENV-ENV is an optional alist of environment variables from direnv."
   (let* ((program (car command))
          (program-args (cdr command))
-         (remote-program (tramp-rpc--resolve-executable vec program))
          ;; Get terminal dimensions from buffer or use defaults
          (size (tramp-rpc--get-terminal-size buffer))
          (rows (cdr size))
          (cols (car size))
          ;; Build environment - merge direnv env with TERM
          (term-env (or (getenv "TERM") "xterm-256color"))
-         (full-env (append direnv-env `(("TERM" . ,term-env))))
+         (full-env (tramp-rpc--build-process-env
+                    vec localname (append direnv-env `(("TERM" . ,term-env)))))
          ;; Start the PTY process on remote
          (result (tramp-rpc--call vec "process.start_pty"
-                                   `((cmd . ,remote-program)
+                                  `((cmd . ,program)
                                      (args . ,(vconcat program-args))
                                      (cwd . ,localname)
                                      (rows . ,rows)
