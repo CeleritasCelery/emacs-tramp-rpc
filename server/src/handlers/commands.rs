@@ -207,16 +207,16 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn find_existing_start(path: &Path) -> Option<PathBuf> {
+fn find_existing_start(path: &Path) -> Option<&Path> {
     if path.exists() {
-        return Some(canonical_or_original(path));
+        return Some(path);
     }
 
-    let mut current = path.to_path_buf();
+    let mut current = path;
     while !current.exists() {
-        current = current.parent()?.to_path_buf();
+        current = current.parent()?;
     }
-    Some(canonical_or_original(&current))
+    Some(current)
 }
 
 fn as_search_dir(path: &Path) -> Option<PathBuf> {
@@ -298,10 +298,12 @@ pub async fn highlevel_locate_dominating_file_multi(params: &Value) -> HandlerRe
 
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(&params.file);
+        // Preserve lexical path shape instead of canonicalizing symlinks.
+        // TRAMP clients rely on this to compute repo-relative paths correctly.
         let Some(existing_start) = find_existing_start(&path) else {
             return Ok(Value::Array(vec![]));
         };
-        let Some(start_dir) = as_search_dir(&existing_start) else {
+        let Some(start_dir) = as_search_dir(existing_start) else {
             return Ok(Value::Array(vec![]));
         };
 
@@ -349,7 +351,7 @@ pub async fn highlevel_dir_locals_find_file_cache_update(params: &Value) -> Hand
                 "cache" => Value::Nil
             });
         };
-        let Some(start_dir) = as_search_dir(&existing_start) else {
+        let Some(start_dir) = as_search_dir(&canonical_or_original(existing_start)) else {
             return Ok(msgpack_map! {
                 "file" => file_value,
                 "locals" => Value::Nil,
