@@ -1076,6 +1076,19 @@ and returns a valid path."
       (should (member "file-aab.txt" completions))
       (should-not (member "other.txt" completions)))))
 
+(ert-deftest tramp-rpc-test12b-file-name-completion-symlink-directory ()
+  "Ensure completion marks symlinks to directories with trailing slash."
+  (skip-unless (tramp-rpc-test-enabled))
+
+  (tramp-rpc-test--with-temp-dir dir
+    (let ((real-dir (concat dir "/real-dir"))
+          (link-dir (concat dir "/link-dir")))
+      (make-directory real-dir t)
+      (make-symbolic-link "real-dir" link-dir)
+      (let ((completions (file-name-all-completions "" dir)))
+        (should (member "real-dir/" completions))
+        (should (member "link-dir/" completions))))))
+
 ;;; ============================================================================
 ;;; Test 13: File System Info
 ;;; ============================================================================
