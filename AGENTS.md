@@ -32,6 +32,16 @@ When testing updates to the rust server, always copy it to a temporary location 
 
 Always test changes to the code.
 
+This package requires tramp >= 2.8.1.3. This should be provided as the `tramp source code directory` in `.config`. Set this with `export TRAMP_TEST_SOURCE=<path>` for test commands that load Tramp (`test/tramp-rpc-tests.el`, `test/run-tramp-tests.el`, and `test/run-tests.sh`).
+
+## Remote host for integration tests
+
+Do not use `localhost` for remote integration runs. Use the actual test host:
+
+`TRAMP_RPC_TEST_HOST=<remote target>`
+
+Set this environment variable for `--remote` and `--upstream` test runs.
+
 ## Test Example
 
 running all tests that start with `tramp-rpc-test` in tramp-rpc-tests.el

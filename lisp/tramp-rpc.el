@@ -2058,16 +2058,25 @@ to the built-in implementation."
 
 (defun tramp-rpc-handle-make-directory (dir &optional parents)
   "Like `make-directory' for TRAMP-RPC files."
-  (tramp-skeleton-make-directory dir parents
-    (tramp-rpc--call v "dir.create"
-                     (append (tramp-rpc--encode-path localname)
-                             ;; Don't pass parents here - the skeleton
-                             ;; handles the recursive parent creation.
-                             `((parents . :msgpack-false)
-                               (mode . ,(default-file-modes)))))
-    ;; Flush parent directory properties so file-exists-p sees the new dir.
-    (tramp-flush-directory-properties v (file-name-directory localname))
-    (tramp-rpc--invalidate-cache-for-path dir)))
+  (if parents
+      ;; Avoid TRAMP skeleton parent recursion. Let the RPC server create
+      ;; all missing parents in one call.
+      (with-parsed-tramp-file-name (expand-file-name dir) nil
+        (tramp-rpc--call v "dir.create"
+                         (append (tramp-rpc--encode-path localname)
+                                 `((parents . t)
+                                   (mode . ,(default-file-modes)))))
+        ;; Flush parent directory properties so file-exists-p sees new dirs.
+        (tramp-flush-directory-properties v (file-name-directory localname))
+        (tramp-rpc--invalidate-cache-for-path dir))
+    (tramp-skeleton-make-directory dir parents
+      (tramp-rpc--call v "dir.create"
+                       (append (tramp-rpc--encode-path localname)
+                               `((parents . :msgpack-false)
+                                 (mode . ,(default-file-modes)))))
+      ;; Flush parent directory properties so file-exists-p sees the new dir.
+      (tramp-flush-directory-properties v (file-name-directory localname))
+      (tramp-rpc--invalidate-cache-for-path dir))))
 
 (defun tramp-rpc-handle-delete-directory (directory &optional recursive trash)
   "Like `delete-directory' for TRAMP-RPC files."

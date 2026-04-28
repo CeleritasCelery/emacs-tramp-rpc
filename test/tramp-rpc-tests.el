@@ -828,7 +828,7 @@ This exercises copy-then-delete for cross-remote renames."
   (let ((dir (concat (tramp-rpc-test--make-temp-name) "/nested/path")))
     (unwind-protect
         (progn
-          (tramp-rpc-test--with-call-count 9
+          (tramp-rpc-test--with-call-count 1
             (make-directory dir t))
           (should (file-directory-p dir)))
       (ignore-errors (delete-directory
