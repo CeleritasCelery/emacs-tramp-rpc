@@ -6694,8 +6694,8 @@ options can not reintroduce one (see #213)."
                      (seq-position ssh-args "RequestTTY=yes")))
           (should (member "ControlMaster=yes" ssh-args))
           (should (member "-N" ssh-args))
-          (should (eq (gethash owned-socket
-                               tramp-rpc--owned-controlmasters)
+          (should (eq (car (gethash owned-socket
+                                   tramp-rpc--owned-controlmasters))
                       establish-process)))
       ;; Resource cleanup runs even when an assertion in the body fails.
       ;; Delete the mock master process before killing its buffers, so
@@ -6726,8 +6726,14 @@ options can not reintroduce one (see #213)."
          exit-args)
     (unwind-protect
         (progn
-          (puthash socket-a process-a tramp-rpc--owned-controlmasters)
-          (puthash socket-b process-b tramp-rpc--owned-controlmasters)
+          (puthash socket-a
+                   (cons process-a
+                         (nth 10 (file-attributes socket-a 'integer)))
+                   tramp-rpc--owned-controlmasters)
+          (puthash socket-b
+                   (cons process-b
+                         (nth 10 (file-attributes socket-b 'integer)))
+                   tramp-rpc--owned-controlmasters)
           ;; ControlPersist can outlive this establishing process.
           (delete-process process-a)
           (cl-letf (((symbol-function 'tramp-rpc--controlmaster-socket-path)
@@ -6743,7 +6749,7 @@ options can not reintroduce one (see #213)."
           (should (member (format "ControlPath=%s" socket-a) exit-args))
           (should-not (member (format "ControlPath=%s" socket-b) exit-args))
           (should-not (gethash socket-a tramp-rpc--owned-controlmasters))
-          (should (eq (gethash socket-b tramp-rpc--owned-controlmasters)
+          (should (eq (car (gethash socket-b tramp-rpc--owned-controlmasters))
                       process-b))
           (should (process-live-p process-b)))
       (when (process-live-p process-a) (delete-process process-a))
@@ -6752,6 +6758,45 @@ options can not reintroduce one (see #213)."
       (when (buffer-live-p buffer-b) (kill-buffer buffer-b))
       (when (file-exists-p socket-a) (delete-file socket-a))
       (when (file-exists-p socket-b) (delete-file socket-b)))))
+
+(ert-deftest tramp-rpc-mock-test-controlmaster-cleanup-skips-replaced-socket ()
+  "Cleanup does not send ssh -O exit when the socket was replaced by another Emacs.
+After our ControlMaster expires, another Emacs may create a new socket at the
+same path.  The stored inode no longer matches, so we must not close it."
+  (skip-unless tramp-rpc-mock-test--tramp-rpc-loaded)
+  (let* ((vec (tramp-dissect-file-name "/rpc:user@same-host:/"))
+         (original-socket (make-temp-file "tramp-rpc-orig-sock"))
+         (original-inode (nth 10 (file-attributes original-socket 'integer)))
+         (proc-buf (generate-new-buffer " *tramp-rpc-sock-test*"))
+         (proc (make-pipe-process :name "tramp-rpc-sock-test"
+                                  :buffer proc-buf :noquery t))
+         (tramp-rpc--owned-controlmasters (make-hash-table :test 'equal))
+         exit-called)
+    (unwind-protect
+        (progn
+          ;; Record the original socket inode.
+          (puthash original-socket (cons proc original-inode)
+                   tramp-rpc--owned-controlmasters)
+          ;; Simulate our master expiring and another Emacs creating a
+          ;; replacement at the same path (different inode).
+          (delete-file original-socket)
+          (write-region "" nil original-socket nil 'silent)
+          ;; The replacement socket has a different inode.
+          (should-not (equal original-inode
+                             (nth 10 (file-attributes original-socket 'integer))))
+          (cl-letf (((symbol-function 'tramp-rpc--controlmaster-socket-path)
+                     (lambda (_vec) original-socket))
+                    ((symbol-function 'call-process)
+                     (lambda (_program _infile _destination _display &rest args)
+                       (when (member "-O" args)
+                         (setq exit-called t))
+                       0)))
+            (tramp-rpc--cleanup-controlmaster-unlocked vec))
+          ;; Must not have issued ssh -O exit to the replacement socket.
+          (should-not exit-called))
+      (when (process-live-p proc) (delete-process proc))
+      (when (buffer-live-p proc-buf) (kill-buffer proc-buf))
+      (when (file-exists-p original-socket) (delete-file original-socket)))))
 
 (ert-deftest tramp-rpc-mock-test-controlmaster-action-tolerates-late-socket ()
   "A dead establish process still succeeds when its socket appears late.

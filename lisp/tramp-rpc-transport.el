@@ -122,9 +122,11 @@ The directory must exist and be writable."
   :group 'tramp-rpc)
 
 (defvar tramp-rpc--owned-controlmasters (make-hash-table :test 'equal)
-  "Map owned ControlMaster socket paths to their establishing processes.
-An entry remains valid after its process exits because `ControlPersist' can
-leave the master running in the background.")
+  "Map owned ControlMaster socket paths to (PROCESS . INODE) pairs.
+PROCESS is the establishing SSH process (may be dead when `ControlPersist'
+backgrounds the master).  INODE is the inode number of the socket file at the
+time it was created, used to distinguish this socket instance from a
+replacement created at the same path by another Emacs process.")
 
 (defcustom tramp-rpc-controlmaster-persist 600
   "How long (in seconds) to keep ControlMaster connections alive.
@@ -1107,7 +1109,13 @@ Returns non-nil on success."
             ;; tramp-process-actions throws on failure; reaching here means
             ;; the persistent master owns PROCESS and BUFFER.
             (sleep-for 0.1)
-            (puthash socket-path process tramp-rpc--owned-controlmasters)
+            ;; Record the socket's inode alongside the process so cleanup can
+            ;; verify it is still our socket and not a replacement created at
+            ;; the same path by another Emacs process.
+            (let* ((socket-attrs (file-attributes socket-path 'integer))
+                   (socket-inode (and socket-attrs (nth 10 socket-attrs))))
+              (puthash socket-path (cons process socket-inode)
+                       tramp-rpc--owned-controlmasters))
             (setq success t))
         (unless success
           (remhash socket-path tramp-rpc--owned-controlmasters)
@@ -1464,11 +1472,20 @@ receive `ssh -O exit', which would disconnect that other session."
                   (tramp-rpc--ssh-detail-port vec)))
            (proxyjump (tramp-rpc--hops-to-proxyjump vec))
            (socket-path (tramp-rpc--controlmaster-socket-path vec))
-           (auth-process
-            (gethash socket-path tramp-rpc--owned-controlmasters))
+           (entry (gethash socket-path tramp-rpc--owned-controlmasters))
+           (auth-process (and (consp entry) (car entry)))
+           (stored-inode (and (consp entry) (cdr entry)))
            (auth-buffer (and (processp auth-process)
                              (process-buffer auth-process)))
-           (owned (processp auth-process)))
+           ;; Verify the socket's inode to distinguish our socket from a
+           ;; replacement created at the same path by another Emacs process.
+           (current-inode (let ((attrs (and stored-inode
+                                            (file-attributes socket-path
+                                                             'integer))))
+                            (and attrs (nth 10 attrs))))
+           (owned (and (processp auth-process)
+                       stored-inode
+                       (equal stored-inode current-inode))))
       ;; Close the ControlMaster socket gracefully via ssh -O exit.
       ;; This is a local control message (no network round-trip), so fast.
       (when (and owned (file-exists-p socket-path))
