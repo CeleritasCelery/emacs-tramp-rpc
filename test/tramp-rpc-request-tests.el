@@ -348,13 +348,15 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
   "Assert a relay notification received inside a synchronous RPC wait is handled.
 CONNECTION-PROCESS is the transport the waiter listens on.  DELIVER runs
 inside the first `accept-process-output\=' and must buffer the response the
-waiter expects.  WAIT performs the synchronous call; its value is returned."
+waiter expects.  WAIT performs the synchronous call; its value is returned.
+The helper also verifies that the output payload in the notification is queued."
   (let* ((relay (make-pipe-process
                  :name "tramp-rpc-mock-test-request-relay"
                  :noquery t))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
          (original-accept-process-output
           (symbol-function 'accept-process-output))
+         queued-output
          response-delivered
          result)
     (unwind-protect
@@ -366,17 +368,21 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
                          :pending-output nil :pending-exit nil
                          :delivery-timer nil)
                    tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'accept-process-output)
+          (cl-letf (((symbol-function 'tramp-rpc--queue-process-output)
+                     (lambda (_proc stdout _stderr _buf)
+                       (setq queued-output stdout)))
+                    ((symbol-function 'accept-process-output)
                      (lambda (&rest args)
                        (if response-delivered
                            (apply original-accept-process-output args)
                          (setq response-delivered t)
                          (tramp-rpc--handle-process-output-notification
                           connection-process
-                          `((pid . 42)))
+                          '((pid . 42) (stdout . "ping")))
                          (funcall deliver)
                          t))))
             (setq result (funcall wait)))
+          (should (equal queued-output "ping"))
           result)
       (when (process-live-p relay)
         (delete-process relay)))))
