@@ -5,6 +5,8 @@
 (require 'cl-lib)
 (require 'tramp-rpc)
 
+(declare-function tramp-rpc--handle-process-output-notification
+                  "tramp-rpc-process" (connection params))
 (declare-function tramp-rpc--invalidate-timed-out-connection "tramp-rpc-transport"
                   (process vec event))
 (declare-function tramp-rpc-mock-test--wait-for "tramp-rpc-mock-tests"
@@ -341,9 +343,9 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (should (equal '(:id 202 :result second)
                      (gethash 202 (tramp-rpc-connection-pending-responses connection)))))))
 
-(defun tramp-rpc-mock-test-request--assert-poll-survives-wait
+(defun tramp-rpc-mock-test-request--assert-notification-survives-wait
     (vec connection-process deliver wait)
-  "Assert a relay poll scheduled inside a synchronous RPC wait stays live.
+  "Assert a relay notification received inside a synchronous RPC wait is handled.
 CONNECTION-PROCESS is the transport the waiter listens on.  DELIVER runs
 inside the first `accept-process-output\=' and must buffer the response the
 waiter expects.  WAIT performs the synchronous call; its value is returned."
@@ -353,7 +355,6 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
          (original-accept-process-output
           (symbol-function 'accept-process-output))
-         (next-reads 0)
          response-delivered
          result)
     (unwind-protect
@@ -361,33 +362,27 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
           (puthash relay
                    (list :vec vec :pid 42
                          :connection-process connection-process
-                         :delivery-timer nil :poll-timer nil)
+                         :stderr-buffer nil
+                         :pending-output nil :pending-exit nil
+                         :delivery-timer nil)
                    tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (&rest _) (cl-incf next-reads)))
-                    ((symbol-function 'accept-process-output)
+          (cl-letf (((symbol-function 'accept-process-output)
                      (lambda (&rest args)
                        (if response-delivered
                            (apply original-accept-process-output args)
                          (setq response-delivered t)
-                         (tramp-rpc--handle-async-read-response
-                          relay
-                          '(:result ((stdout . nil)
-                                     (stderr . nil)
-                                     (exited . nil))))
+                         (tramp-rpc--handle-process-output-notification
+                          connection-process
+                          `((pid . 42)))
                          (funcall deliver)
                          t))))
-            (setq result (funcall wait))
-            (tramp-rpc-mock-test--wait-for
-             (lambda () (= next-reads 1))
-             "next async process read" relay))
-          (should (= next-reads 1))
+            (setq result (funcall wait)))
           result)
       (when (process-live-p relay)
         (delete-process relay)))))
 
-(ert-deftest tramp-rpc-mock-test-request-wait-preserves-async-process-poll ()
-  "An async process response received during a sync wait schedules its next poll."
+(ert-deftest tramp-rpc-mock-test-request-wait-preserves-async-process-notification ()
+  "A push notification received during a sync wait is handled without disrupting the wait."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal)))
@@ -398,7 +393,7 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
                 ((symbol-function 'process-send-string)
                  (lambda (&rest _) nil)))
         (should (eq 'done
-                    (tramp-rpc-mock-test-request--assert-poll-survives-wait
+                    (tramp-rpc-mock-test-request--assert-notification-survives-wait
                      vec process
                      (lambda ()
                        (puthash 301 '(:id 301 :result done)
@@ -407,8 +402,8 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
                        (tramp-rpc--call-with-timeout
                         vec "test" nil 1 0.01)))))))))
 
-(ert-deftest tramp-rpc-mock-test-request-batch-wait-preserves-async-process-poll ()
-  "An async process response received during a batch wait schedules its next poll."
+(ert-deftest tramp-rpc-mock-test-request-batch-wait-preserves-async-process-notification ()
+  "A push notification received during a batch wait is handled without disrupting the wait."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal)))
@@ -421,7 +416,7 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
                 ((symbol-function 'tramp-rpc-protocol-decode-batch-response)
                  (lambda (_response) 'batch-result)))
         (should (eq 'batch-result
-                    (tramp-rpc-mock-test-request--assert-poll-survives-wait
+                    (tramp-rpc-mock-test-request--assert-notification-survives-wait
                      vec process
                      (lambda ()
                        (puthash 302 '(:id 302 :result batch)
@@ -429,14 +424,14 @@ waiter expects.  WAIT performs the synchronous call; its value is returned."
                      (lambda ()
                        (tramp-rpc--call-batch vec '(("test" . nil)))))))))))
 
-(ert-deftest tramp-rpc-mock-test-request-receive-preserves-async-process-poll ()
-  "An async process response received during a pipelined wait schedules its next poll."
+(ert-deftest tramp-rpc-mock-test-request-receive-preserves-async-process-notification ()
+  "A push notification received during a pipelined wait is handled without disrupting the wait."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let ((vec (tramp-rpc-mock-test-request--vec))
           (tramp-rpc--connections (make-hash-table :test 'equal)))
       (tramp-rpc--track-pending-request connection 303)
       (should (equal '((303 . (:id 303 :result pipelined)))
-                     (tramp-rpc-mock-test-request--assert-poll-survives-wait
+                     (tramp-rpc-mock-test-request--assert-notification-survives-wait
                       vec process
                       (lambda ()
                         (puthash 303 '(:id 303 :result pipelined)
