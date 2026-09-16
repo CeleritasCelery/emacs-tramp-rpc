@@ -227,7 +227,6 @@ pub(super) struct ManagedProcess {
     pub(super) child: Child,
     pub(super) child_pid: u32,
     pub(super) lifecycle: Arc<Mutex<()>>,
-    pub(super) read_lock: Arc<Mutex<()>>,
     pub(super) exit_status: Option<ExitStatus>,
     pub(super) shared_exit_status: Arc<StdMutex<Option<ExitStatus>>>,
     pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -572,7 +571,6 @@ pub async fn start(params: Value) -> HandlerResult {
 
     let managed = ManagedProcess {
         lifecycle: Arc::new(Mutex::new(())),
-        read_lock: Arc::new(Mutex::new(())),
         exit_status: None,
         shared_exit_status: Arc::new(StdMutex::new(None)),
         stdin: Arc::new(Mutex::new(child.stdin.take())),
@@ -669,7 +667,7 @@ pub async fn read(params: Value) -> HandlerResult {
 
     let timeout = params.timeout_ms.unwrap_or(0);
 
-    let (stdout, stderr, lifecycle, read_lock, shared_exit_status) = {
+    let (stdout, stderr, lifecycle, shared_exit_status) = {
         let processes = get_process_map().lock().await;
         let managed = processes
             .get(&params.pid)
@@ -678,21 +676,12 @@ pub async fn read(params: Value) -> HandlerResult {
             managed.stdout.clone(),
             managed.stderr.clone(),
             managed.lifecycle.clone(),
-            managed.read_lock.clone(),
             managed.shared_exit_status.clone(),
         )
     };
 
-    // A read owns output consumption through the terminal map-removal decision.
-    // This prevents a concurrent EOF reader from removing bytes another request
-    // has already consumed but not yet returned.
-    let _read_guard = read_lock.lock().await;
-
     // Try to read stdout/stderr (with optional blocking timeout) without
-    // holding the global process map lock.  `process.read` is long-polled by
-    // the Emacs client; holding that lock here makes concurrent
-    // `process.write` calls wait behind the read timeout, which turns LSP
-    // typing into a synchronous round-trip bottleneck.
+    // holding the global process map lock.
     let (stdout_result, stderr_result) =
         try_read_streams(stdout, stderr, params.max_bytes, timeout).await?;
 

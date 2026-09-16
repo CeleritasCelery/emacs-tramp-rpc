@@ -295,7 +295,6 @@ The dispatcher exposes these public methods:
 | Process | ~process.subscribe~ | Subscribe to managed process output and exit notifications. |
 | Process | ~process.unsubscribe~ | Stop managed process notifications. |
 | Process | ~process.write~ | Write to managed process stdin. |
-| Process | ~process.read~ | Read managed process output manually. |
 | Process | ~process.status~ | Return managed process status. |
 | Process | ~process.close_stdin~ | Close managed process stdin. |
 | Process | ~process.kill~ | Signal a managed process. |
@@ -304,7 +303,6 @@ The dispatcher exposes these public methods:
 | PTY | ~process.start_pty~ | Start a pseudo-terminal process. |
 | PTY | ~process.subscribe_pty~ | Subscribe to pseudo-terminal output and exit notifications. |
 | PTY | ~process.unsubscribe_pty~ | Stop pseudo-terminal notifications. |
-| PTY | ~process.read_pty~ | Read pseudo-terminal output manually. |
 | PTY | ~process.write_pty~ | Write pseudo-terminal input. |
 | PTY | ~process.resize_pty~ | Resize a pseudo-terminal. |
 | PTY | ~process.kill_pty~ | Signal a pseudo-terminal process. |

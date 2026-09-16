@@ -677,8 +677,6 @@ Also clears the executable, variable `exec-path', and login-shell caches."
          (current (gethash key tramp-rpc--connections)))
     (when (and current
                (or (null process) (eq process (tramp-rpc-connection-process current))))
-      (when-let* ((transport (tramp-rpc-connection-process current)))
-        (tramp-rpc-protocol--clear-deferred-polls-for-target transport))
       (remhash key tramp-rpc--connections)
       (tramp-rpc--flush-owned-route-connection-properties vec)
       (remhash key tramp-rpc--exec-path-cache)
@@ -1133,10 +1131,6 @@ wrappers and dynamic loaders can print the same text for unrelated failures."
   (and (not (process-live-p process))
        (memq (process-exit-status process) '(126 127))))
 
-(defun tramp-rpc--connection-sentinel (process _event)
-  "Discard deferred protocol state when RPC connection PROCESS closes."
-  (unless (process-live-p process)
-    (tramp-rpc-protocol--clear-deferred-polls-for-target process)))
 
 (defun tramp-rpc--start-server-process (vec binary-path &optional sudo-password)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
@@ -1231,8 +1225,7 @@ Returns the connection plist.  Signals `remote-file-error' on failure."
            :coding 'binary
            :noquery t
            :stderr stderr-buffer
-           :filter #'tramp-rpc--connection-filter
-           :sentinel #'tramp-rpc--connection-sentinel))
+           :filter #'tramp-rpc--connection-filter))
 
     (condition-case start-error
         (progn

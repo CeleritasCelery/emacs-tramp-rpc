@@ -3248,7 +3248,6 @@ cleanup of all connections has run."
         (kill-buffer buf)))
     (clrhash tramp-rpc--connections))
   ;; Clear all RPC-specific caches.
-  (tramp-rpc-protocol--clear-deferred-polls)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'

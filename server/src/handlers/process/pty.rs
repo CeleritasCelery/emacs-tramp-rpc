@@ -26,11 +26,13 @@ use tokio::sync::{Mutex, Notify};
 
 use super::super::HandlerResult;
 use super::super::system::expand_tilde;
+#[cfg(test)]
+use super::MAX_PROCESS_READ_BYTES;
 #[cfg(target_os = "macos")]
 use super::signal_process;
 use super::subscription::{PushSubscription, send_process_notification, stop_push_subscription};
 use super::{
-    MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, MAX_PROCESS_READ_BYTES, SignalCode, dup_cloexec,
+    MANAGED_CHILD_WAIT, MANAGED_PTY_CHILD_WAIT, SignalCode, dup_cloexec,
     require_process_group_signal, set_fd_cloexec, set_fd_nonblocking, signal_process_group,
     wait_for_process_group_exit,
 };
@@ -484,6 +486,7 @@ pub async fn resize_pty(params: Value) -> HandlerResult {
 }
 
 /// Read from a PTY process with optional blocking
+#[cfg(test)]
 pub async fn read_pty(params: Value) -> HandlerResult {
     #[derive(Deserialize)]
     struct Params {
