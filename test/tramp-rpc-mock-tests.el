@@ -1126,8 +1126,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
   (error "tramp-rpc mock tests require Tramp >= %s, but %s is loaded; set TRAMP_SOURCE to a supported checkout"
          tramp-rpc-mock-test--minimum-tramp-version tramp-version))
 (require 'tramp-rpc)
-(declare-function tramp-rpc--pty-handle-async-response
-                  "tramp-rpc-process" (local-process response))
+(declare-function tramp-rpc--handle-pty-exit "tramp-rpc-process" (local-process exit-code))
+(declare-function tramp-rpc--queue-pty-delivery
+                  "tramp-rpc-process"
+                  (local-process &optional output exit-code exit-p))
+(declare-function tramp-rpc--queue-process-output
+                  "tramp-rpc-process"
+                  (local-process stdout stderr stderr-buffer))
 (declare-function tramp-rpc-handle-signal-process
                   "tramp-rpc-advice" (process sigcode &optional remote))
 (declare-function tramp-rpc-deploy--download-file
@@ -1776,27 +1781,23 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (buf (list buffer replacement-buffer))
         (when (buffer-live-p buf) (kill-buffer buf))))))
 
-(ert-deftest tramp-rpc-mock-test-pty-read-error-is-terminal ()
-  "PTY RPC errors and malformed responses terminate without another poll."
-  (dolist (response '((:error (:code -32004 :message "read failed"))
-                      (:result ((exited . nil)))))
-    (let ((process (make-pipe-process
-                    :name "tramp-rpc-pty-read-error-mock"
-                    :noquery t))
-          exit-code)
-      (unwind-protect
-          (progn
-            (puthash process '(:vec mock :pid 42 :poll-timer nil)
-                     tramp-rpc--pty-processes)
-            (cl-letf (((symbol-function 'tramp-rpc--handle-pty-exit)
-                       (lambda (_process code)
-                         (setq exit-code code))))
-              (tramp-rpc--pty-handle-async-response process response))
-            (should (= exit-code -1))
-            (should-not (plist-get (gethash process tramp-rpc--pty-processes)
-                                   :poll-timer)))
-        (remhash process tramp-rpc--pty-processes)
-        (when (process-live-p process) (delete-process process))))))
+(ert-deftest tramp-rpc-mock-test-pty-subscription-error-exits-process ()
+  "A PTY subscription error terminates the process with exit code -1."
+  (let ((process (make-pipe-process
+                  :name "tramp-rpc-pty-sub-error-mock"
+                  :noquery t))
+        exit-code)
+    (unwind-protect
+        (progn
+          (puthash process (list :vec 'mock :pid 42
+                                 :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
+            (tramp-rpc--handle-pty-exit process -1))
+          (should (= (process-get process :tramp-rpc-exit-code) -1)))
+      (remhash process tramp-rpc--pty-processes)
+      (when (process-live-p process) (delete-process process)))))
 
 (ert-deftest tramp-rpc-mock-test-pty-sigkill-status-reaches-sentinel-and-exit-status ()
   "A terminal SIGKILL result remains abnormal through the local PTY relay."
@@ -1808,38 +1809,42 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (process-put process :tramp-rpc-pid 42)
           (process-put process :tramp-rpc-user-sentinel
                        (lambda (_process event) (push event events)))
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (puthash process (list :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          ;; This is the read response after explicit remote SIGKILL removed
-          ;; the PTY registry.  Its status must not become local exit 0.
-          (tramp-rpc--pty-handle-async-response
-           process '(:result ((output . nil) (exited . t) (exit_code . 137))))
+          ;; Inject exit via the push notification delivery path.
+          ;; The exit code 137 (SIGKILL) must not become local exit 0.
+          (tramp-rpc--queue-pty-delivery process nil 137 t)
           (accept-process-output process 0.1)
           (should (= (tramp-rpc-handle-process-exit-status process) 137))
           (should (equal events '("exited abnormally with code 137\n"))))
       (remhash process tramp-rpc--pty-processes)
       (when (process-live-p process) (delete-process process)))))
 
-(ert-deftest tramp-rpc-mock-test-pty-terminal-read-error-calls-user-sentinel-once ()
-  "A terminal PTY read error invokes the real user sentinel exactly once."
-  (let* ((process (start-process "tramp-rpc-pty-terminal-error" nil "cat"))
+(ert-deftest tramp-rpc-mock-test-pty-terminal-exit-calls-user-sentinel-once ()
+  "A terminal PTY exit invokes the real user sentinel exactly once."
+  (let* ((process (start-process "tramp-rpc-pty-terminal-exit" nil "cat"))
          (tramp-rpc--pty-processes (make-hash-table :test 'eq))
          (calls 0))
     (unwind-protect
         (progn
           (process-put process :tramp-rpc-user-sentinel
                        (lambda (_ _event) (cl-incf calls)))
-          (puthash process '(:poll-timer nil) tramp-rpc--pty-processes)
+          (puthash process (list :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
+                   tramp-rpc--pty-processes)
           (set-process-sentinel process #'tramp-rpc--pty-sentinel)
-          (tramp-rpc--pty-handle-async-response
-           process '(:error (:code -32004 :message "read failed")))
+          ;; First exit notification (e.g. from subscription error path).
+          (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
+            (tramp-rpc--handle-pty-exit process -1))
           ;; `delete-process' queues the real sentinel callback.
           (accept-process-output process 0.1)
           (should (= calls 1))
           (should-not (gethash process tramp-rpc--pty-processes))
-          ;; A duplicate terminal response cannot invoke it again.
-          (tramp-rpc--pty-handle-async-response
-           process '(:error (:code -32004 :message "read failed")))
+          ;; A duplicate exit cannot invoke it again.
+          (cl-letf (((symbol-function 'tramp-rpc--best-effort) #'ignore))
+            (tramp-rpc--handle-pty-exit process -1))
           (should (= calls 1)))
       (when (process-live-p process) (delete-process process)))))
 
@@ -2015,7 +2020,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest tramp-rpc-mock-test-process-timers-cancelled-after-cleanup ()
-  "Cleanup cancels independent delivery and polling timers without rescheduling."
+  "Cleanup cancels the delivery timer without rescheduling."
   (let* ((vec (tramp-dissect-file-name "/rpc:timer-cleanup:/tmp/"))
          (process (start-process "tramp-rpc-timer-cleanup" nil "cat"))
          (tramp-rpc--async-processes (make-hash-table :test 'eq))
@@ -2024,17 +2029,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
     (unwind-protect
         (progn
           (puthash process (list :vec vec :pid 1
-                                 :delivery-timer nil :poll-timer nil)
+                                 :delivery-timer nil)
                    tramp-rpc--async-processes)
           (tramp-rpc--schedule-process-timer
            tramp-rpc--async-processes process :delivery-timer
            (lambda () (setq fired t)))
-          (tramp-rpc--schedule-process-timer
-           tramp-rpc--async-processes process :poll-timer
-           (lambda () (setq fired t)))
           (let ((info (gethash process tramp-rpc--async-processes)))
-            (should (timerp (plist-get info :delivery-timer)))
-            (should (timerp (plist-get info :poll-timer))))
+            (should (timerp (plist-get info :delivery-timer))))
           (tramp-rpc--cleanup-async-processes vec nil)
           (let ((barrier nil))
             (run-at-time 0 nil (lambda () (setq barrier t)))
@@ -2044,14 +2045,13 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should-not (gethash process tramp-rpc--async-processes)))
       (when (process-live-p process) (delete-process process)))))
 
-(ert-deftest tramp-rpc-mock-test-async-read-delivers-output-while-polling ()
-  "A non-exit read delivers its chunk exactly once while queuing the next read."
+(ert-deftest tramp-rpc-mock-test-async-output-notification-delivers-in-order ()
+  "Two consecutive output notifications are queued and delivered in order."
   (let* ((vec (tramp-dissect-file-name "/rpc:async-output:/tmp/"))
          (buffer (generate-new-buffer " *tramp-rpc-async-output*"))
          (process (let ((process-connection-type nil))
                     (start-process "tramp-rpc-async-output" buffer "cat")))
-         (tramp-rpc--async-processes (make-hash-table :test 'eq))
-         (next-reads 0))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq)))
     (unwind-protect
         (progn
           (set-process-filter
@@ -2061,25 +2061,21 @@ This matches the behavior expected by `tramp-test28-process-file'."
                (goto-char (point-max))
                (insert output))))
           (puthash process (list :vec vec :pid 1
-                                 :delivery-timer nil :poll-timer nil)
+                                 :stderr-buffer nil
+                                 :pending-output nil :pending-exit nil
+                                 :delivery-timer nil)
                    tramp-rpc--async-processes)
-          (cl-letf (((symbol-function 'tramp-rpc--call-async)
-                     (lambda (&rest _) (cl-incf next-reads))))
-            (tramp-rpc--handle-async-read-response
-             process '(:result ((stdout . "chunk-a") (exited . nil))))
-            ;; A second response before timers run must append, not replace,
-            ;; the first queued delivery.
-            (tramp-rpc--handle-async-read-response
-             process '(:result ((stdout . "chunk-b") (exited . nil))))
-            (let ((deadline (+ (float-time) 1.0)))
-              (while (and (< (float-time) deadline)
-                          (or (= next-reads 0)
-                              (with-current-buffer buffer
-                                (not (equal (buffer-string) "chunk-achunk-b")))))
-                (accept-process-output nil 0.01)))
-            (should (= next-reads 1))
-            (with-current-buffer buffer
-              (should (equal (buffer-string) "chunk-achunk-b")))))
+          ;; Queue two output notifications before timers run.  The second
+          ;; must append, not replace, the first queued chunk.
+          (tramp-rpc--queue-process-output process "chunk-a" nil nil)
+          (tramp-rpc--queue-process-output process "chunk-b" nil nil)
+          (let ((deadline (+ (float-time) 1.0)))
+            (while (and (< (float-time) deadline)
+                        (with-current-buffer buffer
+                          (not (equal (buffer-string) "chunk-achunk-b"))))
+              (accept-process-output nil 0.01)))
+          (with-current-buffer buffer
+            (should (equal (buffer-string) "chunk-achunk-b"))))
       (when (process-live-p process) (delete-process process))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 

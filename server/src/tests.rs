@@ -930,9 +930,18 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
         )))
         .await
         .unwrap();
-    // Drain the two subscribe acknowledgements before dropping the connection.
+    // Both subscribe acknowledgements must be successful before dropping.
     for _ in 0..2 {
-        let _ = read_frame(&mut client_reader).await;
+        let ack = read_frame(&mut client_reader).await;
+        assert!(
+            map_get(&ack, "error").is_none(),
+            "subscribe failed: {ack:?}"
+        );
+        assert_eq!(
+            map_get(&ack, "result").and_then(Value::as_bool),
+            Some(true),
+            "subscribe ack not true: {ack:?}"
+        );
     }
 
     // EOF must still finish after cleanup escalates to SIGKILL.
