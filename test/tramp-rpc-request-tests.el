@@ -80,8 +80,76 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
 
-(ert-deftest tramp-rpc-mock-test-request-user-quit-retires-generation ()
-  "User quit detaches and closes the synchronous request generation."
+(ert-deftest tramp-rpc-mock-test-request-user-quit-preserves-generation ()
+  "User quit while waiting preserves the generation and managed processes."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           (tramp-rpc--async-processes (make-hash-table :test 'eq))
+           (managed-process
+            (make-pipe-process :name "tramp-rpc-mock-managed-process"
+                               :noquery t)))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (puthash managed-process
+               (list :vec vec :pid 999 :connection-process process)
+               tramp-rpc--async-processes)
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (_vec) connection))
+                      ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                       (lambda (&rest _) '(102 . "request")))
+                      ((symbol-function 'process-send-string)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'accept-process-output)
+                       (lambda (&rest _) (signal 'quit nil))))
+              (should (eq (condition-case nil
+                              (progn
+                                (tramp-rpc--call-with-timeout
+                                 vec "test" nil 1 0)
+                                nil)
+                            (quit 'quit))
+                          'quit)))
+            (should (process-live-p process))
+            (should (eq connection (tramp-rpc--get-connection vec)))
+            (should (process-live-p managed-process))
+            (should (gethash managed-process tramp-rpc--async-processes))
+            (should-not (tramp-rpc-connection-pending-ids connection))
+            ;; The abandoned response may still arrive, but its released ID
+            ;; must not be retained or interfere with the next request.
+            (let ((messages (list '(:id 102 :result late))))
+              (cl-letf (((symbol-function
+                          'tramp-rpc-protocol-try-read-message)
+                         (lambda (_buffer)
+                           (set-marker (mark-marker) (point-max))
+                           (pop messages))))
+                (tramp-rpc--connection-filter process "late")))
+            (should (zerop
+                     (hash-table-count
+                      (tramp-rpc-connection-pending-responses connection)))))
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (_vec) connection))
+                      ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                       (lambda (&rest _) '(104 . "next-request")))
+                      ((symbol-function 'process-send-string)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'accept-process-output)
+                       (lambda (&rest _)
+                         (puthash
+                          104 '(:id 104 :result next)
+                          (tramp-rpc-connection-pending-responses connection))
+                         t)))
+              (should (eq 'next
+                          (tramp-rpc--call-with-timeout
+                           vec "next" nil 1 0))))
+            (should-not (tramp-rpc-connection-pending-ids connection)))
+        (remhash managed-process tramp-rpc--async-processes)
+        (when (process-live-p managed-process)
+          (delete-process managed-process)))))
+
+(ert-deftest tramp-rpc-mock-test-request-send-quit-retires-generation ()
+  "User quit during a synchronous frame write retires its generation."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
     (let* ((vec (tramp-rpc-mock-test-request--vec))
            (connection connection)
@@ -90,18 +158,22 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
                  (lambda (_vec) connection))
                 ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
-                 (lambda (&rest _) '(102 . "request")))
-                ((symbol-function 'process-send-string) (lambda (&rest _) nil))
-                ((symbol-function 'accept-process-output)
+                 (lambda (&rest _) '(103 . "request")))
+                ((symbol-function 'process-send-string)
                  (lambda (&rest _) (signal 'quit nil)))
                 ((symbol-function 'tramp-rpc--cleanup-async-processes) #'ignore)
                 ((symbol-function 'tramp-rpc--cleanup-pty-processes) #'ignore)
                 ((symbol-function 'tramp-rpc--cleanup-watches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection)
+                 #'ignore)
                 ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
-                ((symbol-function 'tramp-rpc--clear-file-caches-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc-magit--clear-status-cache-for-connection) #'ignore)
-                ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked) #'ignore))
+                ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
+                 #'ignore)
+                ((symbol-function
+                  'tramp-rpc-magit--clear-status-cache-for-connection)
+                 #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked)
+                 #'ignore))
         (should (eq (condition-case nil
                         (progn
                           (tramp-rpc--call-with-timeout vec "test" nil 1 0)
