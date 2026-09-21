@@ -1464,8 +1464,11 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
 
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
-      ;; Use file-local-copy to get a temp local copy, then rename
-      (let ((tmpfile (file-local-copy filename)))
+      ;; Inhibit jka-compr so that compressed file extensions (e.g. .gz)
+      ;; do not cause decompression during file-local-copy or the subsequent
+      ;; write to the tmpfile inside tramp-rpc-handle-file-local-copy.
+      (let ((tmpfile (let ((jka-compr-inhibit t))
+                       (file-local-copy filename))))
         (unwind-protect
             (progn
               (rename-file tmpfile newname ok-if-already-exists)
@@ -1669,7 +1672,8 @@ TRASH non-nil requests moving the file to the trash."
 
 (defun tramp-rpc--write-local-trash-file (filename content stat)
   "Write CONTENT as binary data to local trash FILENAME and apply STAT."
-  (let ((coding-system-for-write 'binary))
+  (let ((jka-compr-inhibit t)
+        (coding-system-for-write 'binary))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert content)
@@ -2362,10 +2366,13 @@ REPLACE non-nil replaces the accessible buffer contents."
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (tramp-skeleton-file-local-copy filename
-    (let ((content (tramp-rpc--read-file-bytes v localname)))
-      (with-temp-file tmpfile
+    (let ((content (tramp-rpc--read-file-bytes v localname))
+          (jka-compr-inhibit t)
+          (coding-system-for-write 'binary))
+      (with-temp-buffer
         (set-buffer-multibyte nil)
-        (insert content)))))
+        (insert content)
+        (write-region (point-min) (point-max) tmpfile nil 0)))))
 
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.
