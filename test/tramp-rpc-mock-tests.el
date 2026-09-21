@@ -1202,8 +1202,8 @@ This matches the behavior expected by `tramp-test28-process-file'."
                      (tramp-rpc--call-pipelined
                       'vec '(("test" . nil))))))))
 
-(ert-deftest tramp-rpc-mock-test-pipelined-timeout-invalidates-connection ()
-  "A live connection with no response is discarded after pipeline timeout."
+(ert-deftest tramp-rpc-mock-test-pipelined-timeout-preserves-connection ()
+  "A live connection remains reusable after a pipeline response timeout."
   (let* ((buffer (generate-new-buffer " *tramp-rpc-pipeline-test*"))
          (process (make-pipe-process :name "tramp-rpc-pipeline-test"
                                      :buffer buffer :noquery t))
@@ -1226,7 +1226,7 @@ This matches the behavior expected by `tramp-test28-process-file'."
                 (error "Expected pipelined response timeout"))
             (remote-file-error
              (should (string-match-p "Timeout" (error-message-string err)))))
-          (should-not (process-live-p process))
+          (should (process-live-p process))
           (should-not (tramp-rpc-connection-pending-ids conn))
           (should (zerop (hash-table-count
                           (tramp-rpc-connection-pending-responses conn)))))
@@ -1781,6 +1781,54 @@ This matches the behavior expected by `tramp-test28-process-file'."
       (dolist (buf (list buffer replacement-buffer))
         (when (buffer-live-p buf) (kill-buffer buf))))))
 
+(ert-deftest tramp-rpc-mock-test-transport-death-preserves-direct-ssh-pty ()
+  "RPC transport death must not delete an independent direct SSH PTY."
+  (let* ((vec (tramp-dissect-file-name "/rpc:direct-survivor:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-direct-survivor*"))
+         (transport (start-process "tramp-rpc-direct-survivor-transport"
+                                   buffer "cat"))
+         (direct-pty (start-process "tramp-rpc-direct-survivor-pty"
+                                    nil "cat"))
+         (connection
+          (tramp-rpc--attach-connection
+           (tramp-rpc--make-connection
+            :process transport :buffer buffer :vec vec)))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq)))
+    (unwind-protect
+        (progn
+          (puthash (tramp-rpc--connection-key vec)
+                   connection tramp-rpc--connections)
+          (puthash direct-pty
+                   (list :vec vec :direct-ssh t
+                         :connection-process transport)
+                   tramp-rpc--pty-processes)
+          (tramp-rpc--cleanup-connection-generation
+           transport vec "transport died\n" :transport-death)
+          (should (process-live-p direct-pty))
+          (should (gethash direct-pty tramp-rpc--pty-processes))
+          ;; A later explicit cleanup still owns independent survivors.
+          (cl-letf (((symbol-function 'tramp-rpc--clear-direnv-cache)
+                     #'ignore)
+                    ((symbol-function
+                      'tramp-rpc--clear-file-caches-for-connection)
+                     #'ignore)
+                    ((symbol-function 'tramp-rpc--cleanup-controlmaster)
+                     #'ignore)
+                    ((symbol-function 'tramp-flush-directory-properties)
+                     #'ignore)
+                    ((symbol-function 'tramp-flush-connection-properties)
+                     #'ignore))
+            (tramp-rpc-cleanup-connection vec))
+          (should-not (process-live-p direct-pty))
+          (should-not (gethash direct-pty tramp-rpc--pty-processes)))
+      (remhash direct-pty tramp-rpc--pty-processes)
+      (dolist (process (list direct-pty transport))
+        (when (process-live-p process)
+          (delete-process process)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest tramp-rpc-mock-test-pty-subscription-error-exits-process ()
   "A PTY subscription error terminates the process with exit code -1."
   (let ((process (make-pipe-process
@@ -1940,6 +1988,41 @@ This matches the behavior expected by `tramp-test28-process-file'."
           (should (eq pty-connection connection)))
       (dolist (process (list transport pipe pty))
         (when (process-live-p process) (delete-process process))))))
+
+(ert-deftest tramp-rpc-mock-test-relay-death-kills-only-owned-remote-process ()
+  "Unexpected relay death must not terminate a sibling managed process."
+  (let* ((vec (tramp-dissect-file-name "/rpc:relay-isolation:/tmp/"))
+         (transport (make-pipe-process
+                     :name "tramp-rpc-relay-isolation-transport" :noquery t))
+         (connection (tramp-rpc--make-connection :process transport))
+         (failed (make-pipe-process
+                  :name "tramp-rpc-relay-isolation-failed" :noquery t))
+         (sibling (make-pipe-process
+                   :name "tramp-rpc-relay-isolation-sibling" :noquery t))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         killed-pids)
+    (unwind-protect
+        (progn
+          (dolist (entry `((,failed . 41) (,sibling . 42)))
+            (process-put (car entry) :tramp-rpc-connection connection)
+            (puthash (car entry)
+                     (list :vec vec :pid (cdr entry)
+                           :connection-process transport)
+                     tramp-rpc--async-processes))
+          (cl-letf (((symbol-function 'process-status)
+                     (lambda (process)
+                       (if (eq process failed) 'exit 'open)))
+                    ((symbol-function 'tramp-rpc--kill-remote-process)
+                     (lambda (_vec pid &optional _signal _connection)
+                       (push pid killed-pids))))
+            (tramp-rpc--pipe-process-sentinel failed "killed\n"))
+          (should (equal killed-pids '(41)))
+          (should (process-live-p sibling))
+          (should (gethash sibling tramp-rpc--async-processes))
+          (should (process-live-p transport)))
+      (dolist (process (list failed sibling transport))
+        (when (process-live-p process)
+          (delete-process process))))))
 
 (ert-deftest tramp-rpc-mock-test-explicit-disconnect-kills-owned-processes-once ()
   "Explicit disconnect requests remote termination before local cleanup."
@@ -6157,6 +6240,48 @@ A rejected sudo password must not be reused on the next attempt, otherwise
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest tramp-rpc-mock-test-cleanup-keep-processes-preserves-rpc-generation ()
+  "TRAMP KEEP-PROCESSES cleanup must preserve the shared RPC generation."
+  (let* ((vec (tramp-dissect-file-name "/rpc:keep-processes:/tmp/"))
+         (buffer (generate-new-buffer " *tramp-rpc-keep-processes*"))
+         (transport (start-process "tramp-rpc-keep-processes-transport"
+                                   buffer "cat"))
+         (relay (start-process "tramp-rpc-keep-processes-relay" nil "cat"))
+         (connection
+          (tramp-rpc--attach-connection
+           (tramp-rpc--make-connection
+            :process transport :buffer buffer :vec vec)))
+         (tramp-rpc--connections (make-hash-table :test 'equal))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         original-called)
+    (unwind-protect
+        (progn
+          (puthash (tramp-rpc--connection-key vec)
+                   connection tramp-rpc--connections)
+          (puthash relay
+                   (list :vec vec :pid 71 :connection-process transport)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'tramp-clear-passwd) #'ignore)
+                    ((symbol-function 'tramp-flush-directory-properties)
+                     #'ignore)
+                    ((symbol-function
+                      'tramp-rpc--clear-file-caches-for-connection)
+                     #'ignore))
+            (tramp-rpc--tramp-cleanup-connection-advice
+             (lambda (&rest _) (setq original-called t))
+             vec 'keep-debug 'keep-password 'keep-processes))
+          (should-not original-called)
+          (should (process-live-p transport))
+          (should (process-live-p relay))
+          (should (eq connection (tramp-rpc--get-connection vec)))
+          (should (gethash relay tramp-rpc--async-processes)))
+      (remhash relay tramp-rpc--async-processes)
+      (dolist (process (list relay transport))
+        (when (process-live-p process)
+          (delete-process process)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest tramp-rpc-mock-test-cleanup-bootstrap-clears-cached-state ()
   "Bootstrap cleanup should remove live and cached TRAMP connection state."
   :tags '(:connection-cleanup)
@@ -8381,6 +8506,90 @@ discard it for being unreadable."
             (tramp-rpc--pty-start-async-read process))
           (should (equal method-called "process.subscribe_pty"))
           (should (eq connection-called connection)))
+      (dolist (proc (list process connection-process))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
+(ert-deftest tramp-rpc-mock-test-async-subscription-retries-before-kill ()
+  "A transient pipe subscription error retries once before killing its child."
+  (let* ((process (start-process "tramp-rpc-subscribe-retry" nil "cat"))
+         (connection-process
+          (start-process "tramp-rpc-subscribe-retry-connection" nil "cat"))
+         (connection (tramp-rpc--make-connection
+                      :process connection-process))
+         (vec (tramp-dissect-file-name "/rpc:subscribe-retry:/tmp/"))
+         (tramp-rpc--async-processes (make-hash-table :test 'eq))
+         callbacks
+         killed)
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-connection connection)
+          (puthash process
+                   (list :vec vec :pid 42
+                         :connection-process connection-process)
+                   tramp-rpc--async-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec _method _params callback
+                                   &optional _connection)
+                       (push callback callbacks)))
+                    ((symbol-function 'tramp-rpc--kill-remote-process)
+                     (lambda (&rest _) (setq killed t))))
+            (tramp-rpc--start-async-read process)
+            (let ((first-callback (car callbacks)))
+              (funcall first-callback
+                       '(:error (:code -32098 :message "temporary"))))
+            (should (= (length callbacks) 2))
+            (should (process-live-p process))
+            (should-not killed)
+            (funcall (car callbacks)
+                     '(:error (:code -32098 :message "still failing")))
+            (should killed)
+            (should-not (process-live-p process))))
+      (remhash process tramp-rpc--async-processes)
+      (dolist (proc (list process connection-process))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
+(ert-deftest tramp-rpc-mock-test-pty-subscription-retries-before-close ()
+  "A transient PTY subscription error retries once before closing its child."
+  (let* ((process (start-process "tramp-rpc-pty-subscribe-retry" nil "cat"))
+         (connection-process
+          (start-process "tramp-rpc-pty-subscribe-retry-connection" nil "cat"))
+         (connection (tramp-rpc--make-connection
+                      :process connection-process))
+         (vec (tramp-dissect-file-name "/rpc:pty-subscribe-retry:/tmp/"))
+         (tramp-rpc--pty-processes (make-hash-table :test 'eq))
+         callbacks
+         closed)
+    (unwind-protect
+        (progn
+          (process-put process :tramp-rpc-vec vec)
+          (process-put process :tramp-rpc-pid 42)
+          (process-put process :tramp-rpc-connection connection)
+          (puthash process
+                   (list :vec vec :pid 42 :rpc-pty t
+                         :connection-process connection-process)
+                   tramp-rpc--pty-processes)
+          (cl-letf (((symbol-function 'tramp-rpc--call-async)
+                     (lambda (_vec _method _params callback
+                                   &optional _connection)
+                       (push callback callbacks)))
+                    ((symbol-function 'tramp-rpc--call)
+                     (lambda (_vec method _params &optional _connection)
+                       (when (equal method "process.close_pty")
+                         (setq closed t)))))
+            (tramp-rpc--pty-start-async-read process)
+            (let ((first-callback (car callbacks)))
+              (funcall first-callback
+                       '(:error (:code -32098 :message "temporary"))))
+            (should (= (length callbacks) 2))
+            (should (process-live-p process))
+            (should-not closed)
+            (funcall (car callbacks)
+                     '(:error (:code -32098 :message "still failing")))
+            (should closed)
+            (should-not (process-live-p process))))
+      (remhash process tramp-rpc--pty-processes)
       (dolist (proc (list process connection-process))
         (when (process-live-p proc)
           (delete-process proc))))))

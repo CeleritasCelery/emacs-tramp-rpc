@@ -1934,8 +1934,6 @@ Returns the result or signals an error."
                expected-id method elapsed
                (buffer-size (tramp-rpc-connection-buffer conn))
                (process-live-p process) stderr-tail)
-              (tramp-rpc--invalidate-timed-out-connection
-               process vec (format "RPC timeout waiting for %s\n" method))
               (signal
                'remote-file-error
                (list (concat
@@ -2001,8 +1999,6 @@ Returns:
                expected-id elapsed
                (buffer-size (tramp-rpc-connection-buffer conn))
                (plist-get state :process-live) stderr-tail)
-              (tramp-rpc--invalidate-timed-out-connection
-               process vec "Batch RPC timeout\n")
               (signal
                'remote-file-error
                (list (concat
@@ -2061,8 +2057,7 @@ When nil, `tramp-rpc-call-timeout' is used.  CONNECTION, when non-nil, is the
 captured connection generation to use."
   (let* ((timeout (or timeout (tramp-rpc--configured-call-timeout)))
          (poll-interval (tramp-rpc--configured-poll-interval))
-         (conn (or connection (tramp-rpc--ensure-connection vec)))
-         (process (tramp-rpc-connection-process conn)))
+         (conn (or connection (tramp-rpc--ensure-connection vec))))
     (tramp-rpc--debug "RECV-PIPE waiting for %d responses: %S" (length ids) ids)
     (tramp-rpc--with-pending-requests (conn ids)
       (let* ((state (tramp-rpc--wait-for-response-ids
@@ -2073,9 +2068,6 @@ captured connection generation to use."
           (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
           (let ((process-live (plist-get state :process-live))
                 (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
-            (when process-live
-              (tramp-rpc--invalidate-timed-out-connection
-               process vec "Pipelined RPC timeout\n"))
             (signal
              'remote-file-error
              (list

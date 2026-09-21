@@ -75,6 +75,12 @@ Also controls process exit detection latency."
   :type 'integer
   :group 'tramp-rpc)
 
+(defcustom tramp-rpc-process-subscribe-retries 1
+  "Number of times to retry a failed process-output subscription.
+The remote child is terminated only after all retries fail."
+  :type 'natnum
+  :group 'tramp-rpc)
+
 (defcustom tramp-rpc-synchronous-pipe-writes nil
   "Whether pipe process writes wait for remote acknowledgement.
 When nil, `process-send-string' and `process-send-region' enqueue ordered
@@ -451,30 +457,55 @@ PID is the remote process ID."
 ;; Server-pushed Process Output (for LSP and interactive processes)
 ;; ============================================================================
 
+(defun tramp-rpc--subscribe-managed-process
+    (local-process table method final-failure &optional attempt)
+  "Subscribe LOCAL-PROCESS in TABLE to METHOD, retrying transient failures.
+FINAL-FAILURE is called with VEC, PID and CONNECTION after retries are
+exhausted.  ATTEMPT is the zero-based retry count."
+  (when (and (processp local-process)
+             (process-live-p local-process))
+    (when-let* ((info (gethash local-process table))
+                (vec (plist-get info :vec))
+                (pid (plist-get info :pid))
+                (connection (process-get local-process
+                                         :tramp-rpc-connection)))
+      (let ((attempt (or attempt 0)))
+        (cl-labels
+            ((failed
+               (message)
+               ;; A cleanup callback from an already-retired generation must
+               ;; not revive retries or terminate a replacement process.
+               (when (and (process-live-p local-process)
+                          (eq info (gethash local-process table))
+                          (eq connection
+                              (process-get local-process
+                                           :tramp-rpc-connection)))
+                 (tramp-rpc--debug
+                  "%s failed pid=%s attempt=%d: %s"
+                  method pid (1+ attempt) message)
+                 (if (< attempt tramp-rpc-process-subscribe-retries)
+                     (tramp-rpc--subscribe-managed-process
+                      local-process table method final-failure (1+ attempt))
+                   (funcall final-failure vec pid connection)))))
+          (condition-case err
+              (tramp-rpc--call-async
+               vec method `((pid . ,pid))
+               (lambda (response)
+                 (when (tramp-rpc-protocol-error-p response)
+                   (failed (tramp-rpc-protocol-error-message response))))
+               connection)
+            (error
+             (failed (error-message-string err)))))))))
+
 (defun tramp-rpc--start-async-read (local-process)
   "Subscribe LOCAL-PROCESS to server-pushed output and exit events."
-  (when (and (processp local-process)
-             (process-live-p local-process)
-             (gethash local-process tramp-rpc--async-processes))
-    (let* ((info (gethash local-process tramp-rpc--async-processes))
-           (vec (plist-get info :vec))
-           (pid (plist-get info :pid))
-           (connection (process-get local-process :tramp-rpc-connection)))
-      (when (and vec pid)
-        (tramp-rpc--debug "ASYNC-PUSH subscribe pid=%s process=%s"
-                          pid local-process)
-        (tramp-rpc--call-async
-         vec "process.subscribe" `((pid . ,pid))
-         (lambda (response)
-           (when (tramp-rpc-protocol-error-p response)
-             (tramp-rpc--debug
-              "ASYNC-PUSH subscribe failed pid=%s: %s"
-              pid (tramp-rpc-protocol-error-message response))
-             (tramp-rpc--best-effort
-               (tramp-rpc--kill-remote-process vec pid 9 connection))
-             (when (process-live-p local-process)
-               (tramp-rpc--best-effort (delete-process local-process)))))
-         connection)))))
+  (tramp-rpc--subscribe-managed-process
+   local-process tramp-rpc--async-processes "process.subscribe"
+   (lambda (vec pid connection)
+     (tramp-rpc--best-effort
+       (tramp-rpc--kill-remote-process vec pid 9 connection))
+     (when (process-live-p local-process)
+       (tramp-rpc--best-effort (delete-process local-process))))))
 
 (defun tramp-rpc--find-async-process-for-notification (connection pid)
   "Find the local relay for remote PID on exact CONNECTION generation."
@@ -1290,26 +1321,14 @@ Returns (COLS . ROWS)."
 
 (defun tramp-rpc--pty-start-async-read (local-process)
   "Subscribe LOCAL-PROCESS to server-pushed PTY output and exit events."
-  (when (and (processp local-process)
-             (process-live-p local-process)
-             (gethash local-process tramp-rpc--pty-processes))
-    (let* ((vec (process-get local-process :tramp-rpc-vec))
-           (pid (process-get local-process :tramp-rpc-pid))
-           (connection (process-get local-process :tramp-rpc-connection)))
-      (when (and vec pid)
-        (tramp-rpc--call-async
-         vec "process.subscribe_pty" `((pid . ,pid))
-         (lambda (response)
-           (when (tramp-rpc-protocol-error-p response)
-             (tramp-rpc--debug
-              "PTY-PUSH subscribe failed pid=%s: %s"
-              pid (tramp-rpc-protocol-error-message response))
-             (tramp-rpc--best-effort
-               (tramp-rpc--call vec "process.close_pty"
-                                `((pid . ,pid)) connection))
-             (when (process-live-p local-process)
-               (tramp-rpc--best-effort (delete-process local-process)))))
-         connection)))))
+  (tramp-rpc--subscribe-managed-process
+   local-process tramp-rpc--pty-processes "process.subscribe_pty"
+   (lambda (vec pid connection)
+     (tramp-rpc--best-effort
+       (tramp-rpc--call vec "process.close_pty"
+                        `((pid . ,pid)) connection))
+     (when (process-live-p local-process)
+       (tramp-rpc--best-effort (delete-process local-process))))))
 
 (defun tramp-rpc--find-pty-process-for-notification (connection pid)
   "Find the RPC PTY relay for remote PID on exact CONNECTION generation."
@@ -1592,7 +1611,8 @@ callbacks that mutate the process registry."
 (defun tramp-rpc--cleanup-pty-processes (&optional vec connection-process remote-cleanup)
   "Clean up PTY processes for VEC and CONNECTION-PROCESS.
 When REMOTE-CLEANUP is non-nil, request remote PTY termination before local
-state is removed."
+state is removed.  Independent direct SSH PTYs survive unexpected RPC
+transport loss; explicit disconnect and global cleanup still remove them."
   (when (and remote-cleanup vec connection-process
              (process-live-p connection-process))
     (when-let* ((connection (tramp-rpc--get-connection vec)))
@@ -1605,13 +1625,25 @@ state is removed."
                            (tramp-rpc--connection-key vec)))
                 (or (null connection-process)
                     (eq connection-process (plist-get info :connection-process))))
-       ;; Keep tracking through delete-process so the wrapped sentinel and
-       ;; user's sentinel are not suppressed.  The final remhash is idempotent.
-       (process-put local-process :tramp-rpc-transport-cleanup t)
-       (process-put local-process :tramp-rpc-transport-dead t)
-       (when (process-live-p local-process)
-         (delete-process local-process))
-       (remhash local-process tramp-rpc--pty-processes)))
+       (let* ((connection
+               (and connection-process
+                    (tramp-rpc--process-connection connection-process)))
+              (reason
+               (and connection
+                    (tramp-rpc-connection-cleanup-reason connection)))
+              (preserve-direct
+               (and (plist-get info :direct-ssh)
+                    (memq reason
+                          '(:transport-death :timeout :protocol-error)))))
+         (unless preserve-direct
+           ;; Keep tracking through delete-process so the wrapped sentinel and
+           ;; user's sentinel are not suppressed.  The final remhash is
+           ;; idempotent.
+           (process-put local-process :tramp-rpc-transport-cleanup t)
+           (process-put local-process :tramp-rpc-transport-dead t)
+           (when (process-live-p local-process)
+             (delete-process local-process))
+           (remhash local-process tramp-rpc--pty-processes)))))
    tramp-rpc--pty-processes))
 
 (defun tramp-rpc--cleanup-process-write-queues (&optional vec connection-process)

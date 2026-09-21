@@ -69,7 +69,7 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
                 ((symbol-function 'float-time) clock))
         (should-error (tramp-rpc--call-with-timeout vec "test" nil 0 0)
                       :type 'remote-file-error)
-        (should (equal (list process vec) invalidated))
+        (should-not invalidated)
         (should-not (tramp-rpc-connection-pending-ids connection))
         (let ((messages (list '(:id 101 :result late))))
           (cl-letf (((symbol-function 'tramp-rpc-protocol-try-read-message)
@@ -306,6 +306,64 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (should-not (tramp-rpc--get-connection vec))
       (should (equal vec controlmaster-cleaned)))))
 
+(ert-deftest tramp-rpc-mock-test-request-wait-timeout-preserves-managed-processes ()
+  "A completed request write timing out must not retire shared processes."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (clock (tramp-rpc-mock-test-request--timeout-clock))
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           (tramp-rpc--async-processes (make-hash-table :test 'eq))
+           (managed-process
+            (make-pipe-process :name "tramp-rpc-timeout-managed-process"
+                               :noquery t)))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (puthash managed-process
+               (list :vec vec :pid 999 :connection-process process)
+               tramp-rpc--async-processes)
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                       (lambda (_vec) connection))
+                      ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                       (lambda (&rest _) '(109 . "request")))
+                      ((symbol-function 'process-send-string)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'float-time) clock))
+              (should-error
+               (tramp-rpc--call-with-timeout vec "slow" nil 0 0)
+               :type 'remote-file-error))
+            (should (process-live-p process))
+            (should (eq connection (tramp-rpc--get-connection vec)))
+            (should (process-live-p managed-process))
+            (should (gethash managed-process tramp-rpc--async-processes))
+            (should-not (tramp-rpc-connection-pending-ids connection)))
+        (remhash managed-process tramp-rpc--async-processes)
+        (when (process-live-p managed-process)
+          (delete-process managed-process))))))
+
+(ert-deftest tramp-rpc-mock-test-request-deferred-quit-preserves-sent-frame ()
+  "A keyboard quit deferred until after a complete write preserves transport."
+  (tramp-rpc-mock-test-request--with-connection (process _buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           (quit-flag nil))
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (&rest _) (setq quit-flag t))))
+        (should
+         (eq (condition-case nil
+                 (progn
+                   (tramp-rpc--send-request-frame
+                    connection vec "request" "interrupted write\n")
+                   nil)
+               (quit 'quit))
+             'quit)))
+      (setq quit-flag nil)
+      (should (process-live-p process))
+      (should (eq connection (tramp-rpc--get-connection vec))))))
+
 (ert-deftest tramp-rpc-mock-test-request-timeout-preserves-replacement-controlmaster ()
   "Timeout cleanup does not tear down a replacement connection."
   (tramp-rpc-mock-test-request--with-connection (process buffer)
@@ -535,7 +593,7 @@ The helper also verifies that the output payload in the notification is queued."
                 ((symbol-function 'float-time) (tramp-rpc-mock-test-request--timeout-clock)))
         (should-error (tramp-rpc--call-batch vec '(("test" . nil)))
                       :type 'remote-file-error)
-        (should (equal (list process vec) invalidated))
+        (should-not invalidated)
         (should-not (tramp-rpc-connection-pending-ids connection))
         (should (zerop (hash-table-count
                         (tramp-rpc-connection-pending-responses connection))))))))
