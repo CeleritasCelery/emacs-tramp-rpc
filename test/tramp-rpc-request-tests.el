@@ -184,6 +184,46 @@ SPEC is (PROCESS BUFFER [CONNECTION]); CONNECTION defaults to `connection'."
       (should-not (tramp-rpc--get-connection vec))
       (should-not (tramp-rpc-connection-pending-ids connection)))))
 
+(ert-deftest tramp-rpc-mock-test-request-async-send-quit-retires-generation ()
+  "User quit during an async frame write retires its generation and calls the callback."
+  (tramp-rpc-mock-test-request--with-connection (process buffer)
+    (let* ((vec (tramp-rpc-mock-test-request--vec))
+           (connection connection)
+           (tramp-rpc--connections (make-hash-table :test 'equal))
+           callback-response)
+      (puthash (tramp-rpc--connection-key vec) connection tramp-rpc--connections)
+      (cl-letf (((symbol-function 'tramp-rpc--ensure-connection)
+                 (lambda (_vec) connection))
+                ((symbol-function 'tramp-rpc-protocol-encode-request-with-id)
+                 (lambda (&rest _) '(104 . "request")))
+                ((symbol-function 'process-send-string)
+                 (lambda (&rest _) (signal 'quit nil)))
+                ((symbol-function 'tramp-rpc--cleanup-async-processes) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-pty-processes) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-watches-for-connection) #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-file-notify-for-connection)
+                 #'ignore)
+                ((symbol-function 'tramp-rpc--clear-direnv-cache) #'ignore)
+                ((symbol-function 'tramp-rpc--clear-file-caches-for-connection)
+                 #'ignore)
+                ((symbol-function
+                  'tramp-rpc-magit--clear-status-cache-for-connection)
+                 #'ignore)
+                ((symbol-function 'tramp-rpc--cleanup-controlmaster-unlocked)
+                 #'ignore))
+        (should (eq (condition-case nil
+                        (progn
+                          (tramp-rpc--call-async
+                           vec "test" nil
+                           (lambda (resp) (setq callback-response resp)))
+                          nil)
+                      (quit 'quit))
+                    'quit)))
+      (should-not (process-live-p process))
+      (should-not (tramp-rpc--get-connection vec))
+      ;; The generation cleanup must have invoked the callback with an error.
+      (should (tramp-rpc-protocol-error-p callback-response)))))
+
 (ert-deftest tramp-rpc-mock-test-request-partial-pipeline-send-quit-retires-generation ()
   "Quit after one pipelined send retires its ambiguously framed generation."
   (tramp-rpc-mock-test-request--with-connection (process buffer)

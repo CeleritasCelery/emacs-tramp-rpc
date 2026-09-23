@@ -1758,17 +1758,20 @@ Returns the request ID."
     (tramp-rpc--debug "SEND-ASYNC id=%s method=%s" id method)
     ;; Register callback with its exact transport generation.  Roll registration
     ;; back if the transport rejects the send; no response can arrive for a
-    ;; request that was never accepted by the process object.
+    ;; request that was never accepted by the process object.  A quit during
+    ;; send retires the whole generation (like the synchronous path) so the
+    ;; callback is invoked via cleanup rather than the rollback remhash.
     (puthash id callback (tramp-rpc-connection-async-callbacks conn))
     (let (sent)
       (unwind-protect
           (prog1
               (progn
-                ;; Send request (binary data with length prefix, no newline)
-                (process-send-string process request)
+                (tramp-rpc--send-request-frame
+                 conn vec request "RPC async send interrupted\n")
                 id)
             (setq sent t))
-        ;; Cover errors, user quits, and any other non-local exit.
+        ;; Cover non-quit errors.  Quits retire the generation, clearing the
+        ;; callback table, so remhash is a harmless no-op in that case.
         (unless sent
           (remhash id (tramp-rpc-connection-async-callbacks conn)))))))
 
@@ -1786,6 +1789,21 @@ Returns the result or signals an error.
 Uses 5s total timeout with 10ms polling.
 VEC is the TRAMP connection vector."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
+
+(defun tramp-rpc--probe-live-connection (vec conn process method)
+  "Probe CONN after a timeout to detect a dead connection.
+Sends a lightweight request on the captured generation CONN.  If the probe
+also fails, invalidates the generation so the next caller reconnects instead
+of hitting the full timeout again.  PROCESS is CONN's transport process.
+METHOD names the timed-out call for logging."
+  (tramp-rpc--debug "PROBE after timeout on method=%s" method)
+  (condition-case _err
+      (tramp-rpc--call-with-timeout vec "process.list" nil 10 0.01 conn)
+    (remote-file-error
+     (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
+     (tramp-rpc--invalidate-timed-out-connection
+      process vec
+      (format "dead connection detected after RPC timeout (method=%s)\n" method)))))
 
 (defun tramp-rpc--find-response-by-id (conn expected-id)
   "Check generation CONN's pending responses for EXPECTED-ID.
@@ -1934,6 +1952,11 @@ Returns the result or signals an error."
                expected-id method elapsed
                (buffer-size (tramp-rpc-connection-buffer conn))
                (process-live-p process) stderr-tail)
+              ;; Probe the connection to distinguish a busy server from a dead
+              ;; SSH tunnel.  If the probe fails the generation is invalidated
+              ;; so the next caller reconnects rather than hitting another full
+              ;; timeout on a dead connection.
+              (tramp-rpc--probe-live-connection vec conn process method)
               (signal
                'remote-file-error
                (list (concat

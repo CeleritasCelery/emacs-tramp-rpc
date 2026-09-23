@@ -1001,16 +1001,25 @@ pub async fn kill_pty(params: Value) -> HandlerResult {
     // without turning a survivable signal such as SIGINT into SIGKILL.
     // Explicit close and connection cleanup retain escalation authority.
     // Explicit SIGKILL also opts out of output draining.
-    // If SIGKILL fails after cancellation, the terminal entry deliberately
-    // remains marked as terminating; PtyIoState cancellation is irreversible.
-    terminate_pty_process(
+    if let Err(error) = terminate_pty_process(
         params.pid,
         signal,
         false,
         signal == libc::SIGKILL,
         signal == libc::SIGKILL,
     )
-    .await?;
+    .await
+    {
+        // SIGKILL delivery failed.  Reset terminating so close_pty can retry;
+        // io cancellation is irreversible but the entry remains reachable.
+        if signal == libc::SIGKILL {
+            let mut processes = get_pty_process_map().lock().await;
+            if let Some(managed) = processes.get_mut(&params.pid) {
+                managed.terminating = false;
+            }
+        }
+        return Err(error);
+    }
     if signal == libc::SIGKILL && subscribed {
         let exit_code = shared_exit_status
             .as_ref()
@@ -1054,8 +1063,15 @@ pub async fn close_pty(params: Value) -> HandlerResult {
         stop_push_subscription(subscription).await;
     }
     // Explicit close is the opt-out from kill's drain-preserving ownership.
-    // A failure leaves the entry terminal because cancellation is irreversible.
-    terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await?;
+    if let Err(error) = terminate_pty_process(params.pid, libc::SIGKILL, true, true, false).await {
+        // SIGKILL delivery failed.  Reset terminating so the caller can retry;
+        // io cancellation is irreversible but the entry remains reachable.
+        let mut processes = get_pty_process_map().lock().await;
+        if let Some(managed) = processes.get_mut(&params.pid) {
+            managed.terminating = false;
+        }
+        return Err(error);
+    }
     discard_terminated_pty_status(params.pid);
     Ok(Value::Boolean(true))
 }

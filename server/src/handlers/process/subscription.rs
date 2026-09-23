@@ -14,8 +14,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::super::HandlerResult;
-use super::pipe::{get_process_map, read};
-use super::pty::{get_pty_process_map, read_pty_now, wait_for_pty_readable};
+use super::pipe::{get_process_map, read, terminate_pipe_process};
+use super::pty::{get_pty_process_map, read_pty_now, terminate_pty_process, wait_for_pty_readable};
 
 const PUSH_READ_MAX_BYTES: usize = 65_536;
 const PUSH_READ_TIMEOUT_MS: u64 = 200;
@@ -83,6 +83,10 @@ fn spawn_pipe_subscription(pid: u32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
             })
             .await;
             let Ok(result) = result else {
+                // Read failed; kill and remove the child so it does not linger
+                // until the connection closes.  Errors are ignored because the
+                // process may have already exited and been removed.
+                let _ = terminate_pipe_process(pid, libc::SIGKILL, false).await;
                 let _ = send_process_notification(
                     "process.exit",
                     msgpack_map! { "pid" => pid, "exit_code" => -1i64 },
@@ -130,6 +134,8 @@ fn spawn_pty_subscription(pid: u32, stop: Arc<AtomicBool>, wake: Arc<Notify>) ->
         while !stop.load(Ordering::Acquire) {
             let result = read_pty_now(pid, PUSH_READ_MAX_BYTES).await;
             let Ok(result) = result else {
+                // Read failed; kill and remove the PTY so it does not linger.
+                let _ = terminate_pty_process(pid, libc::SIGKILL, true, true, false).await;
                 let _ = send_process_notification(
                     "process.pty_exit",
                     msgpack_map! { "pid" => pid, "exit_code" => -1i64 },

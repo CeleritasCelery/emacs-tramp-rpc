@@ -1188,14 +1188,13 @@ async fn failed_pty_teardown_does_not_restore_cancelled_subscription() {
         set_test_process_group_signal_error(None);
         assert!(result.is_err(), "injected signal failure must propagate");
 
+        // The io stays cancelled but terminating is reset so close_pty can retry.
         {
-            let mut processes = get_pty_process_map().lock().await;
-            let managed = processes.get_mut(&pid).expect("terminal PTY entry");
-            assert!(managed.terminating);
+            let processes = get_pty_process_map().lock().await;
+            let managed = processes.get(&pid).expect("terminal PTY entry");
+            assert!(!managed.terminating);
             assert!(managed.io.is_closed());
             assert!(managed.push_subscription.is_none());
-            // Permit explicit cleanup after checking the terminal state.
-            managed.terminating = false;
         }
         close_pty(Value::Map(vec![(
             Value::String("pid".into()),
