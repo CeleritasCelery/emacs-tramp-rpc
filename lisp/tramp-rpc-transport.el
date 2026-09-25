@@ -708,8 +708,11 @@ This is idempotent so it can run from every synchronous wait exit path."
 
 (defmacro tramp-rpc--with-pending-requests (spec &rest body)
   "Run BODY, releasing unresolved request IDS on every exit.
-SPEC is (CONN IDS).  Abandoning a response wait does not invalidate CONN:
-late responses are discarded because their IDs are no longer pending."
+SPEC is (CONN IDS).  Abandoning a wait, including on user quit, leaves the
+transport reusable: `tramp-rpc--connection-filter' discards replies whose ID
+no longer has a waiter, so unrelated requests and processes on CONN survive
+a quit.  Only an ambiguously framed write retires the generation; see
+`tramp-rpc--send-request-frame'."
   (declare (indent 1) (debug t))
   (let ((conn (nth 0 spec))
         (ids (nth 1 spec)))
@@ -717,17 +720,18 @@ late responses are discarded because their IDs are no longer pending."
          (progn ,@body)
        (tramp-rpc--release-pending-requests ,conn ,ids))))
 
-(defun tramp-rpc--send-request-frame (conn vec request event)
-  "Send framed REQUEST through CONN, retiring it if the write is interrupted.
-VEC identifies the connection and EVENT describes an interrupted write.
-A quit during `process-send-string' leaves frame delivery ambiguous, unlike a
-quit after the complete frame was accepted while waiting for its response."
-  (let ((process (tramp-rpc-connection-process conn)))
-    (condition-case interrupted
-        (process-send-string process request)
-      (quit
-       (tramp-rpc--invalidate-interrupted-connection process vec event)
-       (signal (car interrupted) (cdr interrupted))))))
+(defun tramp-rpc--send-request-frame (conn vec bytes event)
+  "Write request frame BYTES to generation CONN for VEC.
+EVENT describes the interrupted operation for transport diagnostics.
+A user quit inside the write leaves frame delivery ambiguous, so the
+generation is retired.  Quits before or after a complete write keep the
+transport usable and must not disconnect its other users."
+  (condition-case interrupted
+      (process-send-string (tramp-rpc-connection-process conn) bytes)
+    (quit
+     (tramp-rpc--invalidate-interrupted-connection
+      (tramp-rpc-connection-process conn) vec event)
+     (signal (car interrupted) (cdr interrupted)))))
 
 (defun tramp-rpc--claim-connection-generation (process vec event reason)
   "Claim PROCESS as a dead generation and detach it from VEC's connection table.
@@ -1766,8 +1770,11 @@ Returns the request ID."
       (unwind-protect
           (prog1
               (progn
+                ;; Send request (binary data with length prefix, no newline).
+                ;; Like the synchronous paths, a quit inside the write
+                ;; leaves framing ambiguous and must retire the generation.
                 (tramp-rpc--send-request-frame
-                 conn vec request "RPC async send interrupted\n")
+                 conn vec request "Async RPC interrupted while sending\n")
                 id)
             (setq sent t))
         ;; Cover non-quit errors.  Quits retire the generation, clearing the
@@ -1790,20 +1797,26 @@ Uses 5s total timeout with 10ms polling.
 VEC is the TRAMP connection vector."
   (tramp-rpc--call-with-timeout vec method params 5 0.01))
 
+(defvar tramp-rpc--probing-connection nil
+  "Non-nil while a dead-connection probe is in progress.
+Prevents recursive probing when the probe itself times out.")
+
 (defun tramp-rpc--probe-live-connection (vec conn process method)
   "Probe CONN after a timeout to detect a dead connection.
 Sends a lightweight request on the captured generation CONN.  If the probe
 also fails, invalidates the generation so the next caller reconnects instead
 of hitting the full timeout again.  PROCESS is CONN's transport process.
 METHOD names the timed-out call for logging."
-  (tramp-rpc--debug "PROBE after timeout on method=%s" method)
-  (condition-case _err
-      (tramp-rpc--call-with-timeout vec "process.list" nil 10 0.01 conn)
-    (remote-file-error
-     (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
-     (tramp-rpc--invalidate-timed-out-connection
-      process vec
-      (format "dead connection detected after RPC timeout (method=%s)\n" method)))))
+  (unless tramp-rpc--probing-connection
+    (tramp-rpc--debug "PROBE after timeout on method=%s" method)
+    (condition-case _err
+        (let ((tramp-rpc--probing-connection t))
+          (tramp-rpc--call-with-timeout vec "process.list" nil 10 0.01 conn))
+      (remote-file-error
+       (tramp-rpc--debug "PROBE failed; invalidating connection for method=%s" method)
+       (tramp-rpc--invalidate-timed-out-connection
+        process vec
+        (format "dead connection detected after RPC timeout (method=%s)\n" method))))))
 
 (defun tramp-rpc--find-response-by-id (conn expected-id)
   "Check generation CONN's pending responses for EXPECTED-ID.
@@ -1932,7 +1945,8 @@ Returns the result or signals an error."
     (tramp-rpc--with-pending-requests (conn (list expected-id))
       ;; Send request (binary data with length prefix, no newline)
       (tramp-rpc--send-request-frame
-       conn vec request (format "RPC interrupted while sending %s\n" method))
+       conn vec request
+       (format "RPC interrupted while sending %s\n" method))
 
       (let* ((state (tramp-rpc--wait-for-response-ids
                      conn (list expected-id) total-timeout
@@ -2022,6 +2036,7 @@ Returns:
                expected-id elapsed
                (buffer-size (tramp-rpc-connection-buffer conn))
                (plist-get state :process-live) stderr-tail)
+              (tramp-rpc--probe-live-connection vec conn process "batch")
               (signal
                'remote-file-error
                (list (concat
@@ -2065,6 +2080,8 @@ Returns a list of request IDs in the same order."
               (tramp-rpc--debug "SEND-PIPE id=%s method=%s" id (car req))
               (push id ids)
               (tramp-rpc--track-pending-request conn id)
+              ;; Only a quit inside the write makes frame delivery ambiguous.
+              ;; A quit between two complete frames leaves the stream intact.
               (tramp-rpc--send-request-frame
                conn vec bytes "Pipelined RPC interrupted while sending\n")))
           (setq completed t)
@@ -2089,8 +2106,11 @@ captured connection generation to use."
              (responses (plist-get state :responses)))
         (when remaining-ids
           (tramp-rpc--debug "RECV-PIPE missing ids: %S" remaining-ids)
-          (let ((process-live (plist-get state :process-live))
+          (let ((process (tramp-rpc-connection-process conn))
+                (process-live (plist-get state :process-live))
                 (stderr-tail (tramp-rpc--connection-stderr-tail conn)))
+            (when process-live
+              (tramp-rpc--probe-live-connection vec conn process "pipeline"))
             (signal
              'remote-file-error
              (list
@@ -2290,7 +2310,7 @@ actual PATH line, matching the robustness of upstream TRAMP."
 (defconst tramp-rpc--system-info-property "tramp-rpc-system-info"
   "TRAMP connection property storing the cached system.info response.")
 
-(defcustom tramp-rpc--watcher-unavailable-ttl 30
+(defcustom tramp-rpc-watcher-unavailable-ttl 30
   "TTL cap in seconds for caches when push notifications are unavailable.
 When the server reports `watcher_available' as false, `fs.events'
 notifications are not running and caches are TTL-only.  Capping to a short
@@ -2302,7 +2322,7 @@ seconds of stale metadata."
 (defvar tramp-rpc--watcher-degraded nil
   "Non-nil when any known connection lacks push notifications.
 Set from `system.info' `watcher_available'.  Once set, metadata and Magit
-process caches use `tramp-rpc--watcher-unavailable-ttl' as a cap.  This is
+process caches use `tramp-rpc-watcher-unavailable-ttl' as a cap.  This is
 global and conservative, one degraded host shortens TTLs for all, because
 cache validity checks do not carry connection context.")
 

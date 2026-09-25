@@ -66,12 +66,15 @@
 (defconst tramp-rpc-method "rpc"
   "TRAMP method for RPC-based remote access.")
 
+(eval-when-compile
+  ;; Compile the deferred registration against TRAMP's real declarations
+  ;; without loading TRAMP when the generated autoload file is evaluated.
+  (require 'tramp))
+
 ;;;###autoload
-(eval-and-compile
-  ;; The autoload file must initialize TRAMP before registering the method.
-  ;; This avoids deferred definitions and lets the byte compiler validate every
-  ;; TRAMP variable and function referenced by the registration code.
-  (require 'tramp)
+(progn
+  (defun tramp-rpc--autoload-register ()
+    "Register TRAMP-RPC after TRAMP has initialized."
   ;; Check, that `tramp-rpc-method' is still bound.  It isn't after
   ;; unloading `tramp-rpc', but this body still exists as compiled
   ;; function in `after-load-alist'.
@@ -91,8 +94,8 @@
   ;;   /rpc:host|su::/path or /rpc:host|docker:container:/path, are
   ;;   handled by tramp-sh, which logs in through the rpc hop as if it
   ;;   were ssh (issue #99).  That happens without ever loading
-  ;;   tramp-rpc.el, so the full parameter set must be installed here at
-  ;;   autoload time, not when the main file is loaded.  RPC-to-RPC
+  ;;   tramp-rpc.el, so the full parameter set must be installed here when
+  ;;   TRAMP loads, not when the main file is loaded.  RPC-to-RPC
   ;;   chains remain RPC-backed.
   ;; This is future-proof: if ssh's parameters change in future TRAMP
   ;; versions, rpc automatically inherits the updates.
@@ -215,12 +218,21 @@ This is called from `tramp-multi-hop-p-hook'."
                (string= (tramp-file-name-host hop-vec) target-host)))))
   (add-hook 'tramp-multi-hop-p-hook #'tramp-rpc-multi-hop-p)))
 
+  ;; TRAMP runs `tramp--startup-hook' after its methods and handlers are
+  ;; initialized.  If TRAMP was loaded first, register immediately instead.
+  (if (featurep 'tramp)
+      (tramp-rpc--autoload-register)
+    (add-hook 'tramp--startup-hook #'tramp-rpc--autoload-register)))
+
 ;; Now the actual implementation
 (require 'cl-lib)
+(require 'cl-extra)
 (require 'json)
 (require 'seq)
 (require 'tramp)
 (require 'tramp-sh)
+(require 'tramp-cache)
+(require 'tramp-compat)
 (require 'tramp-rpc-protocol)
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
@@ -239,13 +251,10 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
-(declare-function tramp-sh-handle-copy-file "tramp-sh"
-                  (filename newname &optional ok-if-already-exists keep-date
-                            preserve-uid-gid preserve-extended-attributes))
 
 
-;; Helper modules only define functions while the main package is loading.
-;; Runtime integration is installed explicitly after `tramp-rpc' is provided.
+;; Helper modules register internal lifecycle callbacks when loaded.
+;; Editor integrations are installed after `tramp-rpc' is provided.
 (require 'tramp-rpc-deploy)
 (require 'tramp-rpc-process)
 (require 'tramp-rpc-advice)
@@ -3195,6 +3204,8 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 ;; Connection cleanup support
 ;; ============================================================================
 
+;; Internal transport teardown must always release file-notify watches.
+;; This is backend lifecycle wiring, not an opt-in editor integration.
 (add-hook 'tramp-rpc-transport-cleanup-functions
           #'tramp-rpc--cleanup-file-notify-for-connection t)
 
@@ -3344,9 +3355,27 @@ cleanup of all connections has run."
             #'tramp-rpc-cleanup-all-connections)
   (add-hook 'tramp-unload-hook #'tramp-rpc--unload-from-tramp))
 
+(defun tramp-rpc--sanitize-native-comp-load-history ()
+  "Remove malformed native-comp entries that prevent unloading.
+
+Native compilation can record anonymous compiled functions as
+entries for `--anonymous-lambda' in `load-history'.  Emacs bug#80446
+causes `unload-feature' to reject those entries.  Remove them from all
+TRAMP-RPC modules before any of the modules are unloaded."
+  (dolist (entry load-history)
+    (when (and (stringp (car entry))
+               (string-match-p
+                (rx bos "tramp-rpc" (opt "-" (+ nonl))
+                    (| ".el" ".elc" ".eln") eos)
+                (file-name-nondirectory (car entry))))
+      (setcdr entry
+              (delete '(defun . --anonymous-lambda) (cdr entry))))))
+
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
 Removes advice and cleans up async processes."
+  ;; Work around Emacs bug#80446 before explicitly unloading helper modules.
+  (tramp-rpc--sanitize-native-comp-load-history)
   ;; Remove high-level external operations from tramp-rpc core.
   (tramp-rpc--remove-external-operation 'locate-dominating-file 'tramp-rpc)
   (tramp-rpc--remove-external-operation 'dir-locals--all-files 'tramp-rpc)
