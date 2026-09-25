@@ -1802,7 +1802,7 @@ VEC is the TRAMP connection vector."
 Prevents recursive probing when the probe itself times out.")
 
 (defun tramp-rpc--probe-live-connection (vec conn process method)
-  "Probe CONN after a timeout to detect a dead connection.
+  "Probe CONN after a timeout to detect a dead connection for VEC.
 Sends a lightweight request on the captured generation CONN.  If the probe
 also fails, invalidates the generation so the next caller reconnects instead
 of hitting the full timeout again.  PROCESS is CONN's transport process.
